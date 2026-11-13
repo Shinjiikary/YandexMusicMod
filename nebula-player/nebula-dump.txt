@@ -1,0 +1,3379 @@
+﻿=== FILE: package.json ===
+{
+  "name": "nebula-player",
+  "version": "1.0.0",
+  "description": "",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron ."
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "devDependencies": {
+    "electron": "^45.2.3"
+  }
+}
+
+=== FILE: main.js ===
+const { app, BrowserWindow, ipcMain, shell, session } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const { pathToFileURL } = require('url');
+
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+const configPath = path.join(app.getPath('userData'), 'nebula-wp-config.json');
+const baseModDir = path.join(process.env.LOCALAPPDATA || path.join(__dirname, '..'), 'YandexMusicMod');
+const customWallpapersDir = path.join(baseModDir, 'wallpapers');
+const censorDir = path.join(baseModDir, 'censor');
+const audioCacheDir = path.join(censorDir, 'audio');
+const localListPath = path.join(censorDir, 'list_v2.json');
+
+for (const dir of [customWallpapersDir, censorDir, audioCacheDir]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+// Зеркала базы FckCensor (jsDelivr работает в РФ без VPN и Zapret)
+const LIST_MIRRORS = [
+  'https://cdn.jsdelivr.net/gh/Hazzz895/FckCensorData@main/list_v2.json',
+  'https://raw.githack.com/Hazzz895/FckCensorData/main/list_v2.json',
+  'https://raw.githubusercontent.com/Hazzz895/FckCensorData/main/list_v2.json'
+];
+
+// Конвертация заблокированных ссылок raw.githubusercontent.com в рабочие CDN-зеркала
+function buildMirrorCandidates(rawUrl) {
+  const urls = [];
+  if (!rawUrl) return urls;
+  const full = rawUrl.includes('://') ? rawUrl : 'https://' + rawUrl;
+
+  const ghMatch = full.match(/^https?:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/i);
+  if (ghMatch) {
+    const [, user, repo, branch, filePath] = ghMatch;
+    urls.push(`https://cdn.jsdelivr.net/gh/${user}/${repo}@${branch}/${filePath}`);
+    urls.push(`https://raw.githack.com/${user}/${repo}/${branch}/${filePath}`);
+  }
+  urls.push(full);
+  return urls;
+}
+
+function downloadUrlBuffer(urlStr) {
+  return new Promise((resolve, reject) => {
+    const client = urlStr.startsWith('http://') ? http : https;
+    const req = client.get(
+      urlStr,
+      {
+        timeout: 15000,
+        headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' }
+      },
+      (res) => {
+        if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) {
+          const nextUrl = new URL(res.headers.location, urlStr).href;
+          res.resume();
+          return downloadUrlBuffer(nextUrl).then(resolve).catch(reject);
+        }
+        if (res.statusCode !== 200) {
+          res.resume();
+          return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Timeout'));
+    });
+  });
+}
+
+async function downloadWithMirrors(rawUrl) {
+  const candidates = Array.isArray(rawUrl) ? rawUrl : buildMirrorCandidates(rawUrl);
+  let lastErr = null;
+  for (const candidate of candidates) {
+    try {
+      const buf = await downloadUrlBuffer(candidate);
+      if (buf && buf.length > 64) return buf;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All mirrors failed');
+}
+
+async function ensureCensorDatabase(forceUpdate = false) {
+  if (!forceUpdate && fs.existsSync(localListPath)) {
+    try {
+      const stat = fs.statSync(localListPath);
+      if (stat.size > 100) return true;
+    } catch (e) {}
+  }
+  try {
+    const buf = await downloadWithMirrors(LIST_MIRRORS);
+    const txt = buf.toString('utf-8');
+    JSON.parse(txt);
+    fs.writeFileSync(localListPath, txt, 'utf-8');
+    return true;
+  } catch (e) {
+    console.error('Failed to download list_v2.json:', e.message);
+    return fs.existsSync(localListPath);
+  }
+}
+
+// Локальный микро-сервер для раздачи чистых MP3 с поддержкой перемотки (HTTP 206 Partial Content)
+let localAudioServerPort = 0;
+const remoteTrackUrlMap = new Map();
+
+function startLocalAudioServer() {
+  return new Promise((resolve) => {
+    const server = http.createServer(async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', '*');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        return res.end();
+      }
+
+      try {
+        const parsed = new URL(req.url, 'http://127.0.0.1');
+        const match = parsed.pathname.match(/^\/track\/([0-9A-Za-z_-]+)\.mp3$/);
+        if (!match) {
+          res.writeHead(404);
+          return res.end('Not found');
+        }
+
+        const trackId = match[1];
+        const cachedFile = path.join(audioCacheDir, `${trackId}.mp3`);
+        let audioBuffer = null;
+
+        // 1. Если MP3 уже есть на диске — берём мгновенно с диска
+        if (fs.existsSync(cachedFile) && fs.statSync(cachedFile).size > 1024) {
+          audioBuffer = fs.readFileSync(cachedFile);
+        } else {
+          // 2. Иначе скачиваем через зеркала и сохраняем в кэш на ПК
+          const remoteUrl = parsed.searchParams.get('src') || remoteTrackUrlMap.get(trackId);
+          if (!remoteUrl) {
+            res.writeHead(404);
+            return res.end('No remote source');
+          }
+          audioBuffer = await downloadWithMirrors(remoteUrl);
+          if (audioBuffer && audioBuffer.length > 1024) {
+            try {
+              fs.writeFileSync(cachedFile, audioBuffer);
+            } catch (e) {}
+          }
+        }
+
+        if (!audioBuffer || audioBuffer.length === 0) {
+          res.writeHead(500);
+          return res.end('Empty audio');
+        }
+
+        const total = audioBuffer.length;
+        const range = req.headers.range;
+
+        if (range) {
+          const parts = range.replace(/bytes=/, '').split('-');
+          const start = parseInt(parts[0], 10) || 0;
+          const end = parts[1] ? parseInt(parts[1], 10) : total - 1;
+          const chunk = audioBuffer.subarray(start, end + 1);
+
+          res.writeHead(206, {
+            'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunk.length,
+            'Content-Type': 'audio/mpeg'
+          });
+          return res.end(chunk);
+        } else {
+          res.writeHead(200, {
+            'Accept-Ranges': 'bytes',
+            'Content-Length': total,
+            'Content-Type': 'audio/mpeg'
+          });
+          return res.end(audioBuffer);
+        }
+      } catch (err) {
+        console.error('Audio server error:', err.message);
+        res.writeHead(502);
+        res.end('Audio fetch error');
+      }
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      localAudioServerPort = server.address().port;
+      resolve(localAudioServerPort);
+    });
+  });
+}
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    }
+  } catch (e) {}
+  return {};
+}
+
+function saveConfig(data) {
+  try {
+    const current = loadConfig();
+    const updated = { ...current, ...data };
+    fs.writeFileSync(configPath, JSON.stringify(updated, null, 2), 'utf-8');
+    return updated;
+  } catch (e) {}
+}
+
+function findWorkshopDirs() {
+  const candidates = new Set([
+    'C:\\Program Files (x86)\\Steam',
+    'C:\\Program Files\\Steam',
+    'C:\\Steam',
+    'D:\\Steam',
+    'D:\\SteamLibrary',
+    'E:\\Steam',
+    'E:\\SteamLibrary',
+    'F:\\SteamLibrary'
+  ]);
+
+  for (const base of Array.from(candidates)) {
+    const vdfPath = path.join(base, 'steamapps', 'libraryfolders.vdf');
+    if (fs.existsSync(vdfPath)) {
+      try {
+        const content = fs.readFileSync(vdfPath, 'utf-8');
+        const matches = content.matchAll(/"path"\s+"([^"]+)"/g);
+        for (const m of matches) {
+          candidates.add(m[1].replace(/\\\\/g, '\\'));
+        }
+      } catch (e) {}
+    }
+  }
+
+  const workshopDirs = [];
+  for (const lib of candidates) {
+    const weDir = path.join(lib, 'steamapps', 'workshop', 'content', '431960');
+    if (fs.existsSync(weDir)) workshopDirs.push(weDir);
+  }
+  return workshopDirs;
+}
+
+function scanAllWallpapers() {
+  const items = [];
+  let weCount = 0;
+  let customCount = 0;
+
+  const weDirs = findWorkshopDirs();
+  for (const weDir of weDirs) {
+    try {
+      const folders = fs.readdirSync(weDir, { withFileTypes: true });
+      for (const dir of folders) {
+        if (!dir.isDirectory()) continue;
+        const itemPath = path.join(weDir, dir.name);
+        const projFile = path.join(itemPath, 'project.json');
+
+        let title = `Wallpaper ${dir.name}`;
+        let videoFile = null;
+        let previewFile = null;
+
+        if (fs.existsSync(projFile)) {
+          try {
+            const proj = JSON.parse(fs.readFileSync(projFile, 'utf-8'));
+            if (proj.title) title = proj.title;
+            if (proj.file) {
+              const candidate = path.join(itemPath, proj.file);
+              if (fs.existsSync(candidate) && /\.(mp4|webm)$/i.test(proj.file)) {
+                videoFile = candidate;
+              }
+            }
+            if (proj.preview) {
+              const pCandidate = path.join(itemPath, proj.preview);
+              if (fs.existsSync(pCandidate)) previewFile = pCandidate;
+            }
+          } catch (e) {}
+        }
+
+        if (!videoFile) {
+          const files = fs.readdirSync(itemPath);
+          const foundVid = files.find((f) => /\.(mp4|webm)$/i.test(f));
+          if (foundVid) videoFile = path.join(itemPath, foundVid);
+          if (!previewFile) {
+            const foundPrev = files.find((f) => /^preview\.(jpg|jpeg|gif|png|webp)$/i.test(f));
+            if (foundPrev) previewFile = path.join(itemPath, foundPrev);
+          }
+        }
+
+        if (videoFile) {
+          weCount++;
+          items.push({
+            id: `we_${dir.name}`,
+            title,
+            source: 'we',
+            videoUrl: pathToFileURL(videoFile).href,
+            previewUrl: previewFile ? pathToFileURL(previewFile).href : null
+          });
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (fs.existsSync(customWallpapersDir)) {
+    try {
+      const files = fs.readdirSync(customWallpapersDir);
+      for (const f of files) {
+        if (/\.(mp4|webm)$/i.test(f)) {
+          customCount++;
+          const fullPath = path.join(customWallpapersDir, f);
+          items.push({
+            id: `custom_${f}`,
+            title: path.parse(f).name,
+            source: 'custom',
+            videoUrl: pathToFileURL(fullPath).href,
+            previewUrl: null
+          });
+        }
+      }
+    } catch (e) {}
+  }
+
+  return { weCount, customCount, items };
+}
+
+let mainWindow;
+
+async function createWindow() {
+  await startLocalAudioServer();
+  await ensureCensorDatabase(false);
+
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    const headers = { ...details.responseHeaders };
+    delete headers['content-security-policy'];
+    delete headers['content-security-policy-report-only'];
+    delete headers['Content-Security-Policy'];
+    callback({ cancel: false, responseHeaders: headers });
+  });
+
+  const iconCandidate = path.join(__dirname, 'src/assets/ym/favicon.ico');
+
+  mainWindow = new BrowserWindow({
+    width: 1400,
+    height: 860,
+    minWidth: 960,
+    minHeight: 640,
+    frame: false,
+    backgroundColor: '#000000',
+    icon: fs.existsSync(iconCandidate) ? iconCandidate : undefined,
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+      contextIsolation: false,
+      nodeIntegration: false,
+      sandbox: false,
+      webSecurity: false
+    }
+  });
+
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (url.includes('yandex.') || url.includes('oauth')) {
+      return {
+        action: 'allow',
+        overrideBrowserWindowOptions: {
+          width: 480,
+          height: 680,
+          autoHideMenuBar: true
+        }
+      };
+    }
+    return { action: 'deny' };
+  });
+
+  mainWindow.loadURL('https://music.yandex.ru/');
+}
+
+app.whenReady().then(createWindow);
+
+app.on('window-all-closed', () => {
+  if (process.platform !== 'darwin') app.quit();
+});
+
+ipcMain.on('window:minimize', () => mainWindow.minimize());
+ipcMain.on('window:maximize', () => {
+  mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize();
+});
+ipcMain.on('window:close', () => mainWindow.close());
+
+ipcMain.on('censor:getInitSync', (event) => {
+  event.returnValue = {
+    port: localAudioServerPort,
+    censorDir,
+    audioCacheDir,
+    localListPath
+  };
+});
+
+ipcMain.on('censor:registerTracks', (event, entries) => {
+  if (Array.isArray(entries)) {
+    for (const [id, url] of entries) {
+      remoteTrackUrlMap.set(String(id), String(url));
+    }
+  }
+});
+
+ipcMain.handle('censor:syncDatabase', async () => {
+  return await ensureCensorDatabase(true);
+});
+
+ipcMain.handle('censor:openAudioFolder', () => shell.openPath(audioCacheDir));
+ipcMain.handle('config:get', () => loadConfig());
+ipcMain.handle('config:set', (e, data) => saveConfig(data));
+ipcMain.handle('wallpaper:scan', () => scanAllWallpapers());
+ipcMain.handle('wallpaper:openFolder', () => shell.openPath(customWallpapersDir));
+
+=== FILE: preload.js ===
+try { require('./censor-bypass.js'); } catch (e) { console.error('[FckCensor]', e); }
+const { ipcRenderer } = require('electron');
+
+(async function initYandexLiquidGlassMod() {
+  if (location.hostname.includes('passport.yandex') || location.hostname.includes('oauth.yandex')) {
+    return;
+  }
+
+  const saved = await ipcRenderer.invoke('config:get');
+
+  const state = {
+    wallpaperUrl: saved.wallpaperUrl || '',
+    wpBrightness: saved.wpBrightness ?? 75,
+    wpBlur: saved.wpBlur ?? 0,
+    softVibeGlow: saved.softVibeGlow ?? true,
+    zenMode: saved.zenMode ?? false,
+
+    glassOpacity: saved.glassOpacity ?? 18,
+    glassSpecular: saved.glassSpecular ?? 75,
+    glassBlur: saved.glassBlur ?? 22,
+    glassPlayBtn: saved.glassPlayBtn ?? false,
+
+    hideNavSearch: saved.hideNavSearch ?? false,
+    hideNavTrends: saved.hideNavTrends ?? false,
+    hideNavConcerts: saved.hideNavConcerts ?? false,
+    hideNavPodcasts: saved.hideNavPodcasts ?? false,
+    hideNavCollection: saved.hideNavCollection ?? false,
+    hideNavPlus: saved.hideNavPlus ?? true,
+    hideNavPins: saved.hideNavPins ?? false,
+    hideVibeCarousel: saved.hideVibeCarousel ?? false,
+
+    hidePlayerCover: saved.hidePlayerCover ?? false,
+    hideArtistBackdrop: saved.hideArtistBackdrop ?? false,
+    hidePlayerTitle: saved.hidePlayerTitle ?? false,
+    hidePlayerArtist: saved.hidePlayerArtist ?? false,
+    hidePlayerPill: saved.hidePlayerPill ?? false,
+    hidePlayerSideBtns: saved.hidePlayerSideBtns ?? false,
+    hidePlayerSkipBtns: saved.hidePlayerSkipBtns ?? false,
+    hideVibeTitle: saved.hideVibeTitle ?? false,
+    hideVibeAiText: saved.hideVibeAiText ?? false
+  };
+
+  let currentFilter = 'all';
+  let wallpaperData = { weCount: 0, customCount: 0, items: [] };
+  let currentShiftPx = 0;
+
+  function saveState(patch) {
+    Object.assign(state, patch);
+    ipcRenderer.invoke('config:set', state);
+    applyDynamicVariables();
+    applyBodyFlags();
+    tagPageElements();
+    updateZenButtonIcon();
+    updateWaveCenterOffset();
+  }
+
+  const style = document.createElement('style');
+  style.id = 'ym-wp-mod-styles';
+  style.textContent = `
+    :root {
+      --wp-brightness: 0.75;
+      --wp-blur: 0px;
+      --lg-bg-alpha: 0.18;
+      --lg-spec-alpha: 0.75;
+      --lg-rim-alpha: 0.36;
+      --lg-blur: 22px;
+      --ym-wave-shift: 0px;
+    }
+
+    /* Прозрачная база */
+    html, body, #__next, .ym-dark-theme, .ym-light-theme {
+      background: transparent !important;
+      background-color: transparent !important;
+    }
+
+    body {
+      position: relative !important;
+      z-index: 2 !important;
+    }
+
+    html *, body * {
+      --ym-background-color-primary-enabled-basic: transparent !important;
+      --ym-background-color-primary-enabled-content: rgba(12, 12, 18, 0.16) !important;
+      --ym-background-color-primary-enabled-vibe: transparent !important;
+      --ym-background-color-primary-enabled-header: transparent !important;
+      --ym-background-color-primary-enabled-player: rgba(18, 20, 28, var(--lg-bg-alpha)) !important;
+    }
+
+    /* Чистые контейнеры без серых рамок */
+    [class*="NavbarDesktop_root"],
+    [class*="DefaultLayout_root"],
+    [class*="MainPage_root"],
+    [class*="VibePage_root"],
+    [class*="VibeBlock_root"],
+    [class*="VibePlayerBar_root"],
+    [class*="VibePlayerBar_progress"],
+    [class*="VibePlayerControls_root"] {
+      background: transparent !important;
+      background-color: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      backdrop-filter: none !important;
+    }
+
+    /* Убираем рекламу */
+    [class*="NavbarDesktopAnimatedDownloadBar"],
+    [class*="PlayerBar_adPopup"],
+    [class*="AudioAd_"] {
+      display: none !important;
+    }
+
+    /* Приподнимаем профиль «Антон Радаев / Плюс» над кнопкой настроек */
+    [class*="NavbarDesktopUserWidget_root"],
+    [class*="NavbarDesktop_user"],
+    [class*="NavbarDesktop_root"] > div:last-child {
+      margin-bottom: 52px !important;
+    }
+
+    /* ================= ЕДИНЫЙ ПЕРЕЕЗД ВСЕГО БЛОКА ВОЛНЫ В ЦЕНТР ================= */
+    [class*="MainPage_root"],
+    [class*="MainPage_vibe"],
+    [class*="VibePage_root"] {
+      overflow: visible !important;
+    }
+
+    [class*="VibePage_root"] {
+      transform: translate3d(var(--ym-wave-shift, 0px), 0, 0) !important;
+      transition: transform 0.38s cubic-bezier(0.22, 1, 0.36, 1) !important;
+    }
+
+    /* ================= ФИКС СЪЕЗЖАНИЯ НАЗВАНИЯ ТРЕКА ПРИ НАЖАТИИ СТОП/ПАУЗЫ ================= */
+    [class*="VibePlayerbarMeta_artists"] {
+      display: none !important;
+    }
+
+    [class*="VibePlayerbarTimecodeContent_root"],
+    [class*="VibePlayerbarTimecodeContent_center"] {
+      display: flex !important;
+      justify-content: center !important;
+      align-items: center !important;
+      text-align: center !important;
+    }
+
+    [class*="VibePage_textContainer"],
+    [class*="VibeButton_root"],
+    [class*="VibeButton_button"],
+    [class*="VibeButton_titleContainer"] {
+      justify-content: center !important;
+      text-align: center !important;
+    }
+
+    /* ================= ЖИДКОЕ СТЕКЛО (LIQUID GLASS) ================= */
+    button[class*="VibePlayerBar_button"]:not([class*="_play"]),
+    [data-ym-part="vibe-capsule"],
+    [data-ym-part="vibe-side-btn"] button,
+    [class*="VibeContextButton_trigger"],
+    [class*="VibeBlock_settingsButton"],
+    [class*="VibeResetButton_button"],
+    [class*="NavbarDesktop_navigation"] a[class*="active"],
+    [class*="NavbarDesktop_navigation"] a:hover,
+    [class*="PlayerBarDesktopWithBackgroundProgressBar_playerBar"],
+    #ym-sidebar-wp-btn,
+    #ym-zen-eye-btn {
+      background: linear-gradient(
+        145deg,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) + 0.14)) 0%,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) * 0.35)) 50%,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) + 0.08)) 100%
+      ) !important;
+      backdrop-filter: blur(var(--lg-blur)) saturate(200%) brightness(1.06) !important;
+      -webkit-backdrop-filter: blur(var(--lg-blur)) saturate(200%) brightness(1.06) !important;
+      border: 1px solid rgba(255, 255, 255, var(--lg-rim-alpha)) !important;
+      box-shadow:
+        inset 0 1.5px 2px 0 rgba(255, 255, 255, var(--lg-spec-alpha)),
+        inset 0 -1.5px 3px 0 rgba(255, 255, 255, calc(var(--lg-spec-alpha) * 0.28)),
+        0 8px 24px -4px rgba(0, 0, 0, 0.45) !important;
+      transition: transform 0.18s cubic-bezier(0.22, 1, 0.36, 1), box-shadow 0.18s ease, background 0.18s ease, opacity 0.28s ease, visibility 0.28s ease !important;
+    }
+
+    [class*="VibePlayerbarTimecodeContent_root"],
+    [class*="VibePlayerBar_playButtonIcon"],
+    [class*="VibePlayerControls_playButtonIcon"],
+    [class*="SonataFullscreenControlsDesktop_playPauseButtonIcon"] {
+      background: transparent !important;
+      border: none !important;
+      box-shadow: none !important;
+      backdrop-filter: none !important;
+    }
+
+    button[class*="VibePlayerBar_button"]:not([class*="_play"]):hover,
+    [data-ym-part="vibe-capsule"]:hover,
+    #ym-sidebar-wp-btn:hover,
+    #ym-zen-eye-btn:hover {
+      transform: translateY(-1px) scale(1.04) !important;
+      box-shadow:
+        inset 0 2px 2.5px 0 rgba(255, 255, 255, calc(var(--lg-spec-alpha) + 0.2)),
+        inset 0 -2px 3px 0 rgba(255, 255, 255, calc(var(--lg-spec-alpha) * 0.4)),
+        0 12px 28px -4px rgba(0, 0, 0, 0.55) !important;
+    }
+
+    /* Кнопка Play */
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerBar_button_play"],
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerBar_playButton"],
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerControls_playButton"] {
+      background: #fed42b !important;
+      color: #000 !important;
+      border: none !important;
+      box-shadow: 0 6px 20px rgba(254, 212, 43, 0.35) !important;
+    }
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerBar_button_play"] svg,
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerBar_playButton"] svg,
+    body:not(.ym-glass-play-btn) button[class*="VibePlayerControls_playButton"] svg {
+      fill: #000 !important;
+      color: #000 !important;
+    }
+
+    body.ym-glass-play-btn button[class*="VibePlayerBar_button_play"],
+    body.ym-glass-play-btn button[class*="VibePlayerBar_playButton"],
+    body.ym-glass-play-btn button[class*="VibePlayerControls_playButton"],
+    body.ym-glass-play-btn button[class*="SonataFullscreenControlsDesktop_sonataPlayButton"] {
+      border-radius: 50% !important;
+      background: radial-gradient(
+        circle at 30% 25%,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) + 0.26)) 0%,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) * 0.5)) 55%,
+        rgba(255, 255, 255, calc(var(--lg-bg-alpha) + 0.14)) 100%
+      ) !important;
+      backdrop-filter: blur(var(--lg-blur)) saturate(220%) brightness(1.15) !important;
+      border: 1px solid rgba(255, 255, 255, calc(var(--lg-rim-alpha) + 0.18)) !important;
+      box-shadow:
+        inset 0 2px 3px 0 rgba(255, 255, 255, 0.85),
+        inset 0 -2px 4px 0 rgba(255, 255, 255, 0.3),
+        0 8px 24px rgba(0, 0, 0, 0.45) !important;
+      color: #fff !important;
+    }
+    body.ym-glass-play-btn button[class*="VibePlayerBar_button_play"] svg,
+    body.ym-glass-play-btn button[class*="VibePlayerBar_playButton"] svg,
+    body.ym-glass-play-btn button[class*="VibePlayerControls_playButton"] svg,
+    body.ym-glass-play-btn button[class*="SonataFullscreenControlsDesktop_sonataPlayButton"] svg {
+      fill: #fff !important;
+      color: #fff !important;
+      filter: drop-shadow(0 2px 6px rgba(0, 0, 0, 0.4)) !important;
+    }
+
+    /* ================= ZEN MODE (КНОПКА ГЛАЗ В ПРАВОМ НИЖНЕМ УГЛУ) ================= */
+    [class*="NavbarDesktop_root"],
+    [class*="DefaultLayout_navbar"],
+    [class*="Navbar_root"],
+    [class*="VibePage_wheel"],
+    #ym-sidebar-wp-btn {
+      transition: opacity 0.32s ease, transform 0.32s cubic-bezier(0.22, 1, 0.36, 1), visibility 0.32s ease !important;
+    }
+
+    html.ym-zen-mode [class*="NavbarDesktop_root"],
+    html.ym-zen-mode [class*="DefaultLayout_navbar"],
+    html.ym-zen-mode [class*="Navbar_root"],
+    html.ym-zen-mode [class*="VibePage_wheel"],
+    html.ym-zen-mode [class*="Vibes_root"],
+    html.ym-zen-mode [class*="VibesAgent_root"],
+    html.ym-zen-mode #ym-sidebar-wp-btn,
+    body.ym-zen-mode #ym-sidebar-wp-btn {
+      opacity: 0 !important;
+      visibility: hidden !important;
+      pointer-events: none !important;
+      transform: translateX(-30px) !important;
+    }
+
+    /* ================= ОТКЛЮЧЕНИЕ ЭЛЕМЕНТОВ ПЛЕЕРА ================= */
+    body.ym-hide-p-cover [class*="VibePage_albumCover"],
+    body.ym-hide-p-cover [class*="PlayerBarDesktopWithBackgroundProgressBar_coverContainer"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-artist-backdrop [class*="VibePage_artistCover"],
+    body.ym-hide-artist-backdrop [class*="VibeArtistCover_root"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-p-title [class*="VibePlayerbarTrackName_"],
+    body.ym-hide-p-title [class*="VibePlayerbarTimecodeContent_trackName"],
+    body.ym-hide-p-title [class*="VibePlayerbarTimecodeContent_explicitMark"],
+    body.ym-hide-p-title [class*="PlayerBarDesktopWithBackgroundProgressBar_meta"] [class*="title"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-p-artist [class*="VibeDynamicArtists_"],
+    body.ym-hide-p-artist [class*="VibePage_textContainer_playing"] [class*="VibePage_text__"],
+    body.ym-hide-p-artist [data-ym-part="vibe-artist"],
+    body.ym-hide-p-artist [class*="PlayerBarDesktopWithBackgroundProgressBar_artists"],
+    body.ym-hide-p-artist [class*="PlayerBarDesktopWithBackgroundProgressBar_artistLink"],
+    body.ym-hide-p-artist [class*="PlayerBarDesktopWithBackgroundProgressBar_description"] {
+      visibility: hidden !important;
+      opacity: 0 !important;
+      pointer-events: none !important;
+    }
+
+    body.ym-hide-p-pill [data-ym-part="vibe-capsule"],
+    body.ym-hide-p-pill [class*="VibePlayerbarMeta_slider"],
+    body.ym-hide-p-pill [class*="VibePlayerbarTimecodeContent_root"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-p-sidebtns [data-ym-part="vibe-side-btn"],
+    body.ym-hide-p-sidebtns button[class*="VibePlayerBar_button"]:not([class*="_play"]),
+    body.ym-hide-p-sidebtns [class*="VibePlayerBar_changeVolume"],
+    body.ym-hide-p-sidebtns [class*="PlayerBarDesktopWithBackgroundProgressBar_infoButtons"],
+    body.ym-hide-p-sidebtns [class*="PlayerBarDesktopWithBackgroundProgressBar_settingsButton"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-p-skipbtns [class*="VibePlayerControls_skipButton"],
+    body.ym-hide-p-skipbtns [class*="SonataFullscreenControlsDesktop_sonataButton"]:not([class*="_play"]):not([class*="Play"]) {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-vibe-title [class*="VibePage_context"],
+    body.ym-hide-vibe-title [class*="VibeContext_root"],
+    body.ym-hide-vibe-title [class*="VibeContextButton_root"],
+    body.ym-hide-vibe-title [data-ym-part="vibe-heading"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-hide-vibe-ai [class*="VibePage_words"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    body.ym-soft-vibe [class*="VibeBlock_vibeAnimation"],
+    body.ym-soft-vibe [class*="VibePage_vibeAnimation"],
+    body.ym-soft-vibe [class*="VibeBlock_root"] video,
+    body.ym-soft-vibe [class*="VibePage_root"] video,
+    body.ym-soft-vibe [class*="VibeBlock_root"] canvas,
+    body.ym-soft-vibe [class*="VibePage_root"] canvas {
+      mix-blend-mode: screen !important;
+      mask-image: radial-gradient(circle at center, rgba(0,0,0,0.95) 22%, rgba(0,0,0,0) 62%) !important;
+      -webkit-mask-image: radial-gradient(circle at center, rgba(0,0,0,0.95) 22%, rgba(0,0,0,0) 62%) !important;
+      background: transparent !important;
+    }
+    body:not(.ym-soft-vibe) [class*="VibeBlock_vibeAnimation"],
+    body:not(.ym-soft-vibe) [class*="VibePage_vibeAnimation"],
+    body:not(.ym-soft-vibe) [class*="VibeBlock_root"] video,
+    body:not(.ym-soft-vibe) [class*="VibePage_root"] video,
+    body:not(.ym-soft-vibe) [class*="VibeBlock_root"] canvas,
+    body:not(.ym-soft-vibe) [class*="VibePage_root"] canvas {
+      display: none !important; opacity: 0 !important;
+    }
+
+    /* СКРЫТИЕ ПУНКТОВ МЕНЮ */
+    body.ym-hide-nav-search [data-ym-nav="search"] { display: none !important; }
+    body.ym-hide-nav-trends [data-ym-nav="trends"] { display: none !important; }
+    body.ym-hide-nav-concerts [data-ym-nav="concerts"] { display: none !important; }
+    body.ym-hide-nav-podcasts [data-ym-nav="podcasts"] { display: none !important; }
+    body.ym-hide-nav-collection [data-ym-nav="collection"] { display: none !important; }
+    body.ym-hide-nav-plus [data-ym-nav="plus"] { display: none !important; }
+    body.ym-hide-nav-pins [class*="NavbarDesktop_pins"], body.ym-hide-nav-pins [data-ym-nav="pins"] { display: none !important; }
+
+    body.ym-hide-vibe-carousel [class*="VibePage_wheel"],
+    body.ym-hide-vibe-carousel [class*="Vibes_root"],
+    body.ym-hide-vibe-carousel [class*="VibesAgent_root"],
+    body.ym-hide-vibe-carousel [class*="VibeAgentCard_root"] {
+      visibility: hidden !important; opacity: 0 !important; pointer-events: none !important;
+    }
+
+    /* ФОНОВЫЕ ОБОИ */
+    #ym-wp-layer {
+      position: fixed !important; inset: 0 !important;
+      width: 100vw !important; height: 100vh !important;
+      z-index: 0 !important; pointer-events: none !important;
+      overflow: hidden !important; background: #050508 !important;
+    }
+    #ym-wp-video {
+      width: 100% !important; height: 100% !important;
+      object-fit: cover !important;
+      filter: brightness(var(--wp-brightness)) blur(var(--wp-blur)) !important;
+    }
+
+    /* КНОПКИ УПРАВЛЕНИЯ */
+    #ym-sidebar-wp-btn {
+      position: fixed !important; left: 14px !important; bottom: 14px !important;
+      width: 192px !important; height: 38px !important; border-radius: 12px !important;
+      color: #fff !important; font-family: 'YSText', sans-serif !important;
+      font-size: 13px !important; font-weight: 600 !important;
+      display: flex !important; align-items: center !important; justify-content: center !important;
+      gap: 9px !important; cursor: pointer !important; z-index: 99990 !important;
+    }
+
+    #ym-zen-eye-btn {
+      position: fixed !important; right: 18px !important; bottom: 16px !important;
+      width: 40px !important; height: 40px !important; border-radius: 50% !important;
+      color: rgba(255, 255, 255, 0.88) !important;
+      display: flex !important; align-items: center !important; justify-content: center !important;
+      cursor: pointer !important; z-index: 99995 !important;
+    }
+    html.ym-zen-mode #ym-zen-eye-btn,
+    body.ym-zen-mode #ym-zen-eye-btn {
+      opacity: 0.35 !important;
+    }
+    html.ym-zen-mode #ym-zen-eye-btn:hover,
+    body.ym-zen-mode #ym-zen-eye-btn:hover {
+      opacity: 1 !important;
+    }
+
+    #ym-top-window-bar {
+      position: fixed !important; top: 0 !important; left: 0 !important; right: 0 !important;
+      height: 32px !important; z-index: 99999 !important; display: flex !important; justify-content: space-between !important; pointer-events: none !important;
+    }
+    #ym-top-drag { flex: 1 !important; height: 100% !important; -webkit-app-region: drag !important; pointer-events: auto !important; }
+    #ym-top-win-btns { display: flex !important; height: 32px !important; -webkit-app-region: no-drag !important; pointer-events: auto !important; }
+    .ym-w-btn {
+      width: 42px !important; height: 32px !important; border: none !important; background: transparent !important;
+      color: rgba(255,255,255,0.7) !important; display: flex !important; align-items: center !important; justify-content: center !important; cursor: pointer !important;
+    }
+    .ym-w-btn:hover { background: rgba(255,255,255,0.12) !important; color: #fff !important; }
+    .ym-w-btn.close:hover { background: #e81123 !important; color: #fff !important; }
+
+    /* МОДАЛКА */
+    #ym-wp-modal-backdrop {
+      position: fixed !important; inset: 0 !important; background: rgba(0, 0, 0, 0.42) !important;
+      z-index: 99998 !important; display: flex !important; align-items: center !important; justify-content: center !important;
+      transition: background 0.2s ease !important;
+    }
+    #ym-wp-modal-backdrop.ym-hidden { display: none !important; }
+    #ym-wp-modal-backdrop.peek-mode { background: transparent !important; }
+
+    #ym-wp-modal {
+      width: 820px !important; max-width: 94vw !important; max-height: 90vh !important;
+      background: linear-gradient(145deg, rgba(24, 18, 38, 0.88), rgba(14, 12, 24, 0.92)) !important;
+      backdrop-filter: blur(30px) saturate(190%) !important;
+      border: 1px solid rgba(255, 255, 255, 0.22) !important;
+      border-radius: 20px !important; display: flex !important; flex-direction: column !important;
+      padding: 20px 24px !important; color: #fff !important; font-family: 'YSText', sans-serif !important; gap: 14px !important; overflow-y: auto !important;
+      transition: opacity 0.2s ease, background 0.2s ease, backdrop-filter 0.2s ease !important;
+    }
+    #ym-wp-modal.peek-mode {
+      background: rgba(14, 12, 24, 0.05) !important;
+      backdrop-filter: none !important;
+      border-color: transparent !important;
+      box-shadow: none !important;
+    }
+    #ym-wp-modal.peek-mode .hide-on-peek { opacity: 0.08 !important; }
+
+    .wp-m-header { display: flex !important; justify-content: space-between !important; align-items: center !important; }
+    .wp-m-title { font-size: 17px !important; font-weight: 800 !important; }
+    .wp-m-stats { font-size: 12px !important; color: #c084fc !important; margin-left: 10px !important; }
+    .wp-m-close { width: 30px !important; height: 30px !important; border-radius: 50% !important; border: 1px solid rgba(255,255,255,0.18) !important; background: rgba(255,255,255,0.08) !important; color: #fff !important; cursor: pointer !important; }
+    .wp-section-box { background: rgba(255, 255, 255, 0.04) !important; border: 1px solid rgba(255, 255, 255, 0.1) !important; border-radius: 14px !important; padding: 12px 14px !important; display: flex !important; flex-direction: column !important; gap: 10px !important; }
+    .wp-sec-title { font-size: 12px !important; font-weight: 700 !important; color: rgba(255,255,255,0.85) !important; display: flex !important; justify-content: space-between !important; align-items: center !important; }
+    .wp-carousel-wrap { display: flex !important; align-items: center !important; gap: 8px !important; }
+    .wp-car-arrow { width: 28px !important; height: 54px !important; border-radius: 10px !important; border: 1px solid rgba(255,255,255,0.18) !important; background: rgba(255,255,255,0.08) !important; color: #fff !important; cursor: pointer !important; flex-shrink: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; }
+    .wp-carousel-track { flex: 1 !important; display: flex !important; gap: 10px !important; overflow-x: auto !important; scroll-behavior: smooth !important; padding-bottom: 2px !important; }
+    .wp-carousel-track::-webkit-scrollbar { display: none !important; }
+    .wp-toggle-card { min-width: 152px !important; padding: 9px 12px !important; border-radius: 11px !important; background: linear-gradient(135deg, rgba(255,255,255,0.1), rgba(255,255,255,0.03)) !important; border: 1px solid rgba(255,255,255,0.14) !important; display: flex !important; align-items: center !important; justify-content: space-between !important; gap: 10px !important; cursor: pointer !important; flex-shrink: 0 !important; }
+    .wp-tc-info { display: flex !important; flex-direction: column !important; gap: 2px !important; }
+    .wp-tc-name { font-size: 12px !important; font-weight: 700 !important; color: #fff !important; }
+    .wp-tc-state { font-size: 10px !important; color: #4ade80 !important; }
+    .wp-toggle-card.is-hidden .wp-tc-state { color: rgba(255,255,255,0.4) !important; }
+    .lg-switch { position: relative !important; width: 36px !important; height: 20px !important; border-radius: 12px !important; background: rgba(255,255,255,0.18) !important; border: 1px solid rgba(255,255,255,0.25) !important; flex-shrink: 0 !important; }
+    .lg-switch::after { content: '' !important; position: absolute !important; top: 2px !important; left: 2px !important; width: 14px !important; height: 14px !important; border-radius: 50% !important; background: #fff !important; transition: transform 0.2s cubic-bezier(0.22, 1, 0.36, 1) !important; }
+    .wp-toggle-card:not(.is-hidden) .lg-switch { background: linear-gradient(135deg, #9333ea, #c084fc) !important; border-color: #e9d5ff !important; }
+    .wp-toggle-card:not(.is-hidden) .lg-switch::after { transform: translateX(16px) !important; }
+    .wp-m-toolbar { display: flex !important; justify-content: space-between !important; align-items: center !important; }
+    .wp-m-tabs, .wp-m-actions { display: flex !important; gap: 8px !important; }
+    .wp-tab-btn, .wp-act-btn { padding: 6px 13px !important; border-radius: 9px !important; border: 1px solid rgba(255, 255, 255, 0.2) !important; background: rgba(255, 255, 255, 0.07) !important; color: #fff !important; font-size: 12px !important; font-weight: 600 !important; cursor: pointer !important; }
+    .wp-tab-btn.active { background: linear-gradient(135deg, #9333ea, #a855f7) !important; border-color: #e9d5ff !important; }
+    .wp-m-grid { height: 185px !important; overflow-y: auto !important; display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 10px !important; }
+    .wp-card { position: relative !important; height: 86px !important; border-radius: 10px !important; overflow: hidden !important; background: rgba(255, 255, 255, 0.04) !important; border: 2px solid rgba(255, 255, 255, 0.1) !important; cursor: pointer !important; display: flex !important; flex-direction: column !important; justify-content: flex-end !important; }
+    .wp-card.active { border-color: #c084fc !important; box-shadow: 0 0 14px rgba(168, 85, 247, 0.55) !important; }
+    .wp-card-thumb { position: absolute !important; inset: 0 !important; width: 100% !important; height: 100% !important; object-fit: cover !important; }
+    .wp-card-off-center { position: absolute !important; inset: 0 !important; display: flex !important; align-items: center !important; justify-content: center !important; font-size: 12px !important; font-weight: 700 !important; color: rgba(255,255,255,0.65) !important; }
+    .wp-card-badge { position: absolute !important; top: 5px !important; right: 5px !important; padding: 2px 6px !important; border-radius: 4px !important; background: rgba(147, 51, 234, 0.85) !important; font-size: 9px !important; font-weight: 800 !important; z-index: 2 !important; }
+    .wp-card-label { position: relative !important; z-index: 2 !important; background: linear-gradient(transparent, rgba(0,0,0,0.9)) !important; padding: 10px 7px 5px 7px !important; font-size: 11px !important; font-weight: 600 !important; white-space: nowrap !important; overflow: hidden !important; text-overflow: ellipsis !important; }
+    .wp-sliders-grid { display: grid !important; grid-template-columns: repeat(4, 1fr) !important; gap: 12px !important; padding-top: 6px !important; border-top: 1px solid rgba(255,255,255,0.1) !important; }
+    .wp-slider-col { display: flex !important; flex-direction: column !important; gap: 5px !important; font-size: 11px !important; color: rgba(255,255,255,0.85) !important; }
+    .wp-slider-col input[type="range"] { -webkit-appearance: none !important; width: 100% !important; height: 5px !important; border-radius: 4px !important; background: rgba(255, 255, 255, 0.22) !important; outline: none !important; cursor: pointer !important; }
+    .wp-slider-col input[type="range"]::-webkit-slider-thumb { -webkit-appearance: none !important; width: 14px !important; height: 14px !important; border-radius: 50% !important; background: #fff !important; cursor: pointer !important; }
+  `;
+
+  function applyDynamicVariables() {
+    const root = document.documentElement;
+    if (!root) return;
+    root.style.setProperty('--wp-brightness', (state.wpBrightness / 100).toFixed(2));
+    root.style.setProperty('--wp-blur', `${state.wpBlur}px`);
+    root.style.setProperty('--lg-bg-alpha', (state.glassOpacity / 100).toFixed(2));
+    root.style.setProperty('--lg-spec-alpha', (state.glassSpecular / 100).toFixed(2));
+    root.style.setProperty('--lg-rim-alpha', ((state.glassSpecular / 100) * 0.52).toFixed(2));
+    root.style.setProperty('--lg-blur', `${state.glassBlur}px`);
+  }
+
+  function applyBodyFlags() {
+    const root = document.documentElement;
+    const b = document.body;
+    if (root) root.classList.toggle('ym-zen-mode', state.zenMode);
+    if (!b) return;
+
+    b.classList.toggle('ym-soft-vibe', state.softVibeGlow);
+    b.classList.toggle('ym-glass-play-btn', state.glassPlayBtn);
+    b.classList.toggle('ym-zen-mode', state.zenMode);
+
+    b.classList.toggle('ym-hide-nav-search', state.hideNavSearch);
+    b.classList.toggle('ym-hide-nav-trends', state.hideNavTrends);
+    b.classList.toggle('ym-hide-nav-concerts', state.hideNavConcerts);
+    b.classList.toggle('ym-hide-nav-podcasts', state.hideNavPodcasts);
+    b.classList.toggle('ym-hide-nav-collection', state.hideNavCollection);
+    b.classList.toggle('ym-hide-nav-plus', state.hideNavPlus);
+    b.classList.toggle('ym-hide-nav-pins', state.hideNavPins);
+    b.classList.toggle('ym-hide-vibe-carousel', state.hideVibeCarousel);
+
+    b.classList.toggle('ym-hide-p-cover', state.hidePlayerCover);
+    b.classList.toggle('ym-hide-artist-backdrop', state.hideArtistBackdrop);
+    b.classList.toggle('ym-hide-p-title', state.hidePlayerTitle);
+    b.classList.toggle('ym-hide-p-artist', state.hidePlayerArtist);
+    b.classList.toggle('ym-hide-p-pill', state.hidePlayerPill);
+    b.classList.toggle('ym-hide-p-sidebtns', state.hidePlayerSideBtns);
+    b.classList.toggle('ym-hide-p-skipbtns', state.hidePlayerSkipBtns);
+    b.classList.toggle('ym-hide-vibe-title', state.hideVibeTitle);
+    b.classList.toggle('ym-hide-vibe-ai', state.hideVibeAiText);
+  }
+
+  function updateWaveCenterOffset() {
+    const vibeRoot = document.querySelector('[class*="VibePage_root"]');
+    const anchor =
+      document.querySelector('[class*="VibePage_playerBlock"]') ||
+      document.querySelector('[class*="VibePage_vibeAnimation"]');
+
+    if (!vibeRoot || !anchor) {
+      if (currentShiftPx !== 0) {
+        currentShiftPx = 0;
+        document.documentElement.style.setProperty('--ym-wave-shift', '0px');
+      }
+      return;
+    }
+
+    if (!state.hideVibeCarousel && !state.zenMode) {
+      if (currentShiftPx !== 0) {
+        currentShiftPx = 0;
+        document.documentElement.style.setProperty('--ym-wave-shift', '0px');
+      }
+      return;
+    }
+
+    const rect = anchor.getBoundingClientRect();
+    if (rect.width === 0) return;
+
+    const naturalCenterX = (rect.left - currentShiftPx) + rect.width / 2;
+
+    let targetCenterX = window.innerWidth / 2;
+    if (!state.zenMode) {
+      const navEl = document.querySelector('[class*="NavbarDesktop_root"]');
+      const navWidth = navEl ? navEl.getBoundingClientRect().width : 210;
+      targetCenterX = Math.round(window.innerWidth / 2 + navWidth * 0.25);
+    }
+
+    const desiredShift = Math.round(targetCenterX - naturalCenterX);
+    if (Math.abs(desiredShift - currentShiftPx) > 2) {
+      currentShiftPx = desiredShift;
+      document.documentElement.style.setProperty('--ym-wave-shift', `${currentShiftPx}px`);
+    }
+  }
+
+  function tagPageElements() {
+    const navRoot = document.querySelector('[class*="NavbarDesktop_root"]');
+    if (navRoot) {
+      const links = navRoot.querySelectorAll('a, button');
+      links.forEach(el => {
+        const txt = (el.textContent || '').trim();
+        const row = el.closest('li') || el;
+        if (txt === 'Поиск') row.setAttribute('data-ym-nav', 'search');
+        else if (txt.includes('Для вас') || txt.includes('Тренды')) row.setAttribute('data-ym-nav', 'trends');
+        else if (txt === 'Концерты') row.setAttribute('data-ym-nav', 'concerts');
+        else if (txt.includes('Книги') || txt.includes('подкасты')) row.setAttribute('data-ym-nav', 'podcasts');
+        else if (txt === 'Коллекция') row.setAttribute('data-ym-nav', 'collection');
+        else if (txt.includes('Ваш Плюс')) row.setAttribute('data-ym-nav', 'plus');
+      });
+      // 4. Авто-вырезание рекламных поп-апов («Так звучит хоккей / Реклама») и нижних промо-плашек («В другой раз»)
+    document.querySelectorAll('[role="dialog"], [class*="Modal_"], [class*="Popup_"], [class*="Notification"], [class*="Banner"], [class*="BarBelow"]').forEach(el => {
+      if (el.id === 'ym-wp-modal' || el.id === 'ym-wp-modal-backdrop') return;
+      const txt = el.textContent || '';
+      if (
+        txt.includes('Реклама') ||
+        txt.includes('В другой раз') ||
+        txt.includes('Расскажите больше') ||
+        txt.includes('Слушать плейлист')
+      ) {
+        const dismissBtn = Array.from(el.querySelectorAll('button')).find(b => {
+          const bTxt = (b.textContent || '').trim();
+          const aria = b.getAttribute('aria-label') || '';
+          return bTxt === 'Закрыть' || bTxt === 'В другой раз' || aria === 'Закрыть';
+        });
+        if (dismissBtn) dismissBtn.click();
+        el.style.setProperty('display', 'none', 'important');
+      }
+    });
+    }
+
+    const progressRow = document.querySelector('[class*="VibePlayerBar_progress"]');
+    if (progressRow) {
+      Array.from(progressRow.children).forEach(child => {
+        const hasTrackInfo = child.querySelector(
+          '[class*="VibePlayerbarTimecode"], [class*="VibePlayerbarTrackName"], [class*="VibePlayerbarMeta"]'
+        ) || child.matches('[class*="VibePlayerbar"]');
+
+        if (hasTrackInfo) {
+          child.setAttribute('data-ym-part', 'vibe-capsule');
+        } else {
+          child.setAttribute('data-ym-part', 'vibe-side-btn');
+        }
+      });
+    }
+
+    const textContainers = document.querySelectorAll(
+      '[class*="VibePage_text__"], [class*="VibeDynamicArtists_root"], [class*="VibePage_button"], [class*="VibeButton_root"]'
+    );
+    textContainers.forEach(el => {
+      const txt = (el.textContent || '').trim();
+      if (!txt) return;
+      if (txt === 'Моя волна') {
+        el.setAttribute('data-ym-part', 'vibe-heading');
+      } else {
+        el.setAttribute('data-ym-part', 'vibe-artist');
+      }
+    });
+  }
+
+  const wpLayer = document.createElement('div');
+  wpLayer.id = 'ym-wp-layer';
+  wpLayer.innerHTML = `<video id="ym-wp-video" loop muted autoplay playsinline></video>`;
+
+  const topBar = document.createElement('div');
+  topBar.id = 'ym-top-window-bar';
+  topBar.innerHTML = `
+    <div id="ym-top-drag"></div>
+    <div id="ym-top-win-btns">
+      <button class="ym-w-btn" id="ym-w-min"><svg width="10" height="10" viewBox="0 0 10 10"><rect y="4.5" width="10" height="1" fill="currentColor"/></svg></button>
+      <button class="ym-w-btn" id="ym-w-max"><svg width="10" height="10" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" stroke="currentColor" stroke-width="1" fill="none"/></svg></button>
+      <button class="ym-w-btn close" id="ym-w-close"><svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5" stroke="currentColor" stroke-width="1.2"/></svg></button>
+    </div>
+  `;
+
+  const sidebarBtn = document.createElement('button');
+  sidebarBtn.id = 'ym-sidebar-wp-btn';
+  sidebarBtn.innerHTML = `
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#d8b4fe" stroke-width="2">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+    <span>Настройки и Обои</span>
+  `;
+
+  const zenEyeBtn = document.createElement('button');
+  zenEyeBtn.id = 'ym-zen-eye-btn';
+  zenEyeBtn.title = 'Скрыть / показать всё, кроме блока волны';
+
+  function updateZenButtonIcon() {
+    if (state.zenMode) {
+      zenEyeBtn.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M17.94 17.94A10.07 10.07 0 0 1 12 20c-7 0-11-8-11-8a18.45 18.45 0 0 1 5.06-5.94M9.9 4.24A9.12 9.12 0 0 1 12 4c7 0 11 8 11 8a18.5 18.5 0 0 1-2.16 3.19m-6.72-1.07a3 3 0 1 1-4.24-4.24"/>
+          <line x1="1" y1="1" x2="23" y2="23"/>
+        </svg>
+      `;
+    } else {
+      zenEyeBtn.innerHTML = `
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+          <circle cx="12" cy="12" r="3"/>
+        </svg>
+      `;
+    }
+  }
+  updateZenButtonIcon();
+
+  const playerModules = [
+    { key: 'hidePlayerCover', label: 'Обложка трека', invert: true },
+    { key: 'hideArtistBackdrop', label: 'Силуэт артиста', invert: true },
+    { key: 'hidePlayerTitle', label: 'Название трека', invert: true },
+    { key: 'hidePlayerArtist', label: 'Автор трека', invert: true },
+    { key: 'hidePlayerPill', label: 'Капсула трека', invert: true },
+    { key: 'hidePlayerSideBtns', label: 'Лайк / Звук / Ещё', invert: true },
+    { key: 'hidePlayerSkipBtns', label: 'Кнопки Пред / След', invert: true },
+    { key: 'glassPlayBtn', label: 'Стеклянный Play', invert: false },
+    { key: 'hideVibeTitle', label: 'Текст «Моя волна»', invert: true },
+    { key: 'hideVibeAiText', label: 'AI-подпись волны', invert: true },
+    { key: 'softVibeGlow', label: 'Сфера волны', invert: false }
+  ];
+
+  const navModules = [
+    { key: 'hideVibeCarousel', label: 'Карусель вайбов', invert: true },
+    { key: 'hideNavPlus', label: 'Ваш Плюс', invert: true },
+    { key: 'hideNavTrends', label: 'Для вас и Тренды', invert: true },
+    { key: 'hideNavConcerts', label: 'Концерты', invert: true },
+    { key: 'hideNavPodcasts', label: 'Книги и подкасты', invert: true },
+    { key: 'hideNavCollection', label: 'Коллекция', invert: true },
+    { key: 'hideNavPins', label: 'Закрепы снизу', invert: true },
+    { key: 'hideNavSearch', label: 'Поиск', invert: true }
+  ];
+
+  const modalBackdrop = document.createElement('div');
+  modalBackdrop.id = 'ym-wp-modal-backdrop';
+  modalBackdrop.className = 'ym-hidden';
+  modalBackdrop.innerHTML = `
+    <div id="ym-wp-modal">
+      <div class="wp-m-header hide-on-peek">
+        <div>
+          <span class="wp-m-title">Кастомизация плеера и Живые обои</span>
+          <span class="wp-m-stats" id="wp-stats-text">Wallpaper Engine: 0 | Своя папка: 0</span>
+        </div>
+        <button class="wp-m-close" id="wp-close-btn">✕</button>
+      </div>
+
+      <div class="wp-section-box hide-on-peek">
+        <div class="wp-sec-title">
+          <span>Элементы плеера по кускам</span>
+        </div>
+        <div class="wp-carousel-wrap">
+          <button class="wp-car-arrow" data-scroll-target="car-player" data-dir="-1">◀</button>
+          <div class="wp-carousel-track" id="car-player"></div>
+          <button class="wp-car-arrow" data-scroll-target="car-player" data-dir="1">▶</button>
+        </div>
+      </div>
+
+      <div class="wp-section-box hide-on-peek">
+        <div class="wp-sec-title">
+          <span>Кнопки левого меню и Карусель «Моей волны»</span>
+        </div>
+        <div class="wp-carousel-wrap">
+          <button class="wp-car-arrow" data-scroll-target="car-nav" data-dir="-1">◀</button>
+          <div class="wp-carousel-track" id="car-nav"></div>
+          <button class="wp-car-arrow" data-scroll-target="car-nav" data-dir="1">▶</button>
+        </div>
+      </div>
+
+      <div class="wp-m-toolbar hide-on-peek">
+        <div class="wp-m-tabs">
+          <button class="wp-tab-btn active" data-tab="all">Все обои</button>
+          <button class="wp-tab-btn" data-tab="we">Wallpaper Engine</button>
+          <button class="wp-tab-btn" data-tab="custom">Своя папка</button>
+        </div>
+        <div class="wp-m-actions">
+          <button class="wp-act-btn" id="wp-refresh-btn">Обновить</button>
+          <button class="wp-act-btn" id="wp-folder-btn">Папка .mp4</button>
+        </div>
+      </div>
+
+      <div class="wp-m-grid hide-on-peek" id="wp-cards-grid"></div>
+
+      <div class="wp-sliders-grid">
+        <div class="wp-slider-col">
+          <span class="hide-on-peek">Яркость обоев</span>
+          <input type="range" id="sl-wp-bright" min="10" max="100" value="${state.wpBrightness}">
+        </div>
+        <div class="wp-slider-col">
+          <span class="hide-on-peek">Размытие обоев</span>
+          <input type="range" id="sl-wp-blur" min="0" max="30" value="${state.wpBlur}">
+        </div>
+        <div class="wp-slider-col">
+          <span class="hide-on-peek">Плотность стекла</span>
+          <input type="range" id="sl-lg-opacity" min="4" max="65" value="${state.glassOpacity}">
+        </div>
+        <div class="wp-slider-col">
+          <span class="hide-on-peek">Сила бликов</span>
+          <input type="range" id="sl-lg-spec" min="10" max="100" value="${state.glassSpecular}">
+        </div>
+      </div>
+    </div>
+  `;
+
+  function renderToggleCarousel(containerId, itemsList) {
+    const container = modalBackdrop.querySelector(`#${containerId}`);
+    if (!container) return;
+
+    container.innerHTML = itemsList.map(item => {
+      const val = state[item.key];
+      const isEnabled = item.invert ? !val : Boolean(val);
+      return `
+        <div class="wp-toggle-card ${isEnabled ? '' : 'is-hidden'}" data-key="${item.key}">
+          <div class="wp-tc-info">
+            <span class="wp-tc-name">${item.label}</span>
+            <span class="wp-tc-state">${isEnabled ? 'Включено' : 'Скрыто'}</span>
+          </div>
+          <div class="lg-switch"></div>
+        </div>
+      `;
+    }).join('');
+
+    container.querySelectorAll('.wp-toggle-card').forEach(card => {
+      card.addEventListener('click', () => {
+        const key = card.getAttribute('data-key');
+        saveState({ [key]: !state[key] });
+        renderToggleCarousel(containerId, itemsList);
+      });
+    });
+  }
+
+  function setWallpaperVideo(url) {
+    state.wallpaperUrl = url || '';
+    const videoEl = wpLayer.querySelector('#ym-wp-video');
+    if (!videoEl) return;
+
+    if (!state.wallpaperUrl) {
+      videoEl.removeAttribute('src');
+      videoEl.load();
+      wpLayer.style.display = 'none';
+    } else {
+      wpLayer.style.display = 'block';
+      if (videoEl.src !== state.wallpaperUrl) {
+        videoEl.src = state.wallpaperUrl;
+      }
+      videoEl.play().catch(() => {});
+    }
+    ipcRenderer.invoke('config:set', state);
+  }
+
+  function renderWallpaperCards() {
+    const grid = modalBackdrop.querySelector('#wp-cards-grid');
+    const stats = modalBackdrop.querySelector('#wp-stats-text');
+    if (!grid || !stats) return;
+
+    stats.textContent = `Wallpaper Engine: ${wallpaperData.weCount} | Своя папка: ${wallpaperData.customCount}`;
+
+    const filtered = wallpaperData.items.filter(item => {
+      if (currentFilter === 'we') return item.source === 'we';
+      if (currentFilter === 'custom') return item.source === 'custom';
+      return true;
+    });
+
+    let html = `
+      <div class="wp-card ${!state.wallpaperUrl ? 'active' : ''}" data-url="">
+        <div class="wp-card-off-center">Выкл</div>
+        <div class="wp-card-label">Стандартный фон</div>
+      </div>
+    `;
+
+    for (const item of filtered) {
+      const isSelected = state.wallpaperUrl === item.videoUrl;
+      const badge = item.source === 'we' ? 'WE' : 'MP4';
+      const thumbMedia = item.previewUrl
+        ? `<img class="wp-card-thumb" src="${item.previewUrl}" loading="lazy" alt="">`
+        : `<video class="wp-card-thumb" src="${item.videoUrl}" muted preload="metadata"></video>`;
+
+      html += `
+        <div class="wp-card ${isSelected ? 'active' : ''}" data-url="${item.videoUrl}">
+          ${thumbMedia}
+          <span class="wp-card-badge">${badge}</span>
+          <div class="wp-card-label">${item.title}</div>
+        </div>
+      `;
+    }
+
+    grid.innerHTML = html;
+    grid.querySelectorAll('.wp-card').forEach(card => {
+      card.addEventListener('click', () => {
+        setWallpaperVideo(card.getAttribute('data-url'));
+        renderWallpaperCards();
+      });
+    });
+  }
+
+  async function refreshWallpapers() {
+    wallpaperData = await ipcRenderer.invoke('wallpaper:scan');
+    renderWallpaperCards();
+  }
+
+  let eventsInitialized = false;
+
+  function bindEventsOnce() {
+    if (eventsInitialized) return;
+    eventsInitialized = true;
+
+    topBar.querySelector('#ym-w-min').addEventListener('click', () => ipcRenderer.send('window:minimize'));
+    topBar.querySelector('#ym-w-max').addEventListener('click', () => ipcRenderer.send('window:maximize'));
+    topBar.querySelector('#ym-w-close').addEventListener('click', () => ipcRenderer.send('window:close'));
+
+    zenEyeBtn.addEventListener('click', () => {
+      saveState({ zenMode: !state.zenMode });
+    });
+
+    window.addEventListener('resize', () => {
+      currentShiftPx = 0;
+      document.documentElement.style.setProperty('--ym-wave-shift', '0px');
+      updateWaveCenterOffset();
+    });
+
+    sidebarBtn.addEventListener('click', async () => {
+      modalBackdrop.classList.remove('ym-hidden');
+      renderToggleCarousel('car-player', playerModules);
+      renderToggleCarousel('car-nav', navModules);
+      await refreshWallpapers();
+    });
+
+    modalBackdrop.querySelector('#wp-close-btn').addEventListener('click', () => {
+      modalBackdrop.classList.add('ym-hidden');
+    });
+
+    modalBackdrop.addEventListener('click', (e) => {
+      if (e.target === modalBackdrop) modalBackdrop.classList.add('ym-hidden');
+    });
+
+    modalBackdrop.querySelectorAll('.wp-car-arrow').forEach(btn => {
+      btn.addEventListener('click', () => {
+        const target = modalBackdrop.querySelector(`#${btn.getAttribute('data-scroll-target')}`);
+        const dir = Number(btn.getAttribute('data-dir'));
+        if (target) target.scrollBy({ left: dir * 320, behavior: 'smooth' });
+      });
+    });
+
+    modalBackdrop.querySelectorAll('.wp-carousel-track').forEach(track => {
+      track.addEventListener('wheel', (e) => {
+        e.preventDefault();
+        track.scrollLeft += e.deltaY;
+      });
+    });
+
+    modalBackdrop.querySelectorAll('.wp-tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        modalBackdrop.querySelectorAll('.wp-tab-btn').forEach(b => b.classList.remove('active'));
+        btn.classList.add('active');
+        currentFilter = btn.getAttribute('data-tab');
+        renderWallpaperCards();
+      });
+    });
+
+    modalBackdrop.querySelector('#wp-refresh-btn').addEventListener('click', refreshWallpapers);
+    modalBackdrop.querySelector('#wp-folder-btn').addEventListener('click', () => {
+      ipcRenderer.invoke('wallpaper:openFolder');
+    });
+
+    const modalEl = modalBackdrop.querySelector('#ym-wp-modal');
+    const sliders = modalBackdrop.querySelectorAll('input[type="range"]');
+    sliders.forEach(s => {
+      s.addEventListener('mousedown', () => {
+        modalEl.classList.add('peek-mode');
+        modalBackdrop.classList.add('peek-mode');
+      });
+    });
+    window.addEventListener('mouseup', () => {
+      modalEl.classList.remove('peek-mode');
+      modalBackdrop.classList.remove('peek-mode');
+    });
+
+    modalBackdrop.querySelector('#sl-wp-bright').addEventListener('input', (e) => {
+      saveState({ wpBrightness: Number(e.target.value) });
+    });
+    modalBackdrop.querySelector('#sl-wp-blur').addEventListener('input', (e) => {
+      saveState({ wpBlur: Number(e.target.value) });
+    });
+    modalBackdrop.querySelector('#sl-lg-opacity').addEventListener('input', (e) => {
+      saveState({ glassOpacity: Number(e.target.value) });
+    });
+    modalBackdrop.querySelector('#sl-lg-spec').addEventListener('input', (e) => {
+      saveState({ glassSpecular: Number(e.target.value) });
+    });
+  }
+
+  function keepAliveMount() {
+    if (!document.documentElement) return;
+
+    if (!document.getElementById('ym-wp-mod-styles') && document.head) {
+      document.head.appendChild(style);
+      applyDynamicVariables();
+    }
+    if (!document.getElementById('ym-wp-layer')) {
+      document.documentElement.prepend(wpLayer);
+      setWallpaperVideo(state.wallpaperUrl);
+    }
+    if (!document.getElementById('ym-top-window-bar')) {
+      document.documentElement.appendChild(topBar);
+    }
+    if (!document.getElementById('ym-sidebar-wp-btn')) {
+      document.documentElement.appendChild(sidebarBtn);
+    }
+    if (!document.getElementById('ym-zen-eye-btn')) {
+      document.documentElement.appendChild(zenEyeBtn);
+    }
+    if (!document.getElementById('ym-wp-modal-backdrop')) {
+      document.documentElement.appendChild(modalBackdrop);
+    }
+
+    applyBodyFlags();
+    tagPageElements();
+    updateWaveCenterOffset();
+    bindEventsOnce();
+  }
+
+  setInterval(keepAliveMount, 300);
+  window.addEventListener('DOMContentLoaded', () => {
+    keepAliveMount();
+    renderToggleCarousel('car-player', playerModules);
+    renderToggleCarousel('car-nav', navModules);
+    refreshWallpapers();
+  });
+})();
+
+=== FILE: censor-bypass.js ===
+const { app, BrowserWindow, ipcMain, shell, session } = require('electron');
+const path = require('path');
+const fs = require('fs');
+const http = require('http');
+const https = require('https');
+const { pathToFileURL } = require('url');
+
+app.commandLine.appendSwitch('enable-gpu-rasterization');
+app.commandLine.appendSwitch('enable-zero-copy');
+app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
+
+const configPath = path.join(app.getPath('userData'), 'nebula-wp-config.json');
+const baseModDir = path.join(process.env.LOCALAPPDATA || path.join(__dirname, '..'), 'YandexMusicMod');
+const customWallpapersDir = path.join(baseModDir, 'wallpapers');
+const censorDir = path.join(baseModDir, 'censor');
+const audioCacheDir = path.join(censorDir, 'audio');
+const localListPath = path.join(censorDir, 'list_v2.json');
+
+for (const dir of [customWallpapersDir, censorDir, audioCacheDir]) {
+  if (!fs.existsSync(dir)) {
+    fs.mkdirSync(dir, { recursive: true });
+  }
+}
+
+// Зеркала базы FckCensor (jsDelivr работает в РФ без VPN и Zapret)
+const LIST_MIRRORS = [
+  'https://cdn.jsdelivr.net/gh/Hazzz895/FckCensorData@main/list_v2.json',
+  'https://raw.githack.com/Hazzz895/FckCensorData/main/list_v2.json',
+  'https://raw.githubusercontent.com/Hazzz895/FckCensorData/main/list_v2.json'
+];
+
+// Конвертация заблокированных ссылок raw.githubusercontent.com в рабочие CDN-зеркала
+function buildMirrorCandidates(rawUrl) {
+  const urls = [];
+  if (!rawUrl) return urls;
+  const full = rawUrl.includes('://') ? rawUrl : 'https://' + rawUrl;
+
+  const ghMatch = full.match(/^https?:\/\/raw\.githubusercontent\.com\/([^/]+)\/([^/]+)\/([^/]+)\/(.+)$/i);
+  if (ghMatch) {
+    const [, user, repo, branch, filePath] = ghMatch;
+    urls.push(`https://cdn.jsdelivr.net/gh/${user}/${repo}@${branch}/${filePath}`); urls.push(`https://raw.githack.com/${user}/${repo}/${branch}/${filePath}`); } urls.push(full); return urls; }  function downloadUrlBuffer(urlStr) { return new Promise((resolve, reject) => { const client = urlStr.startsWith('http://') ? http : https; const req = client.get( urlStr, { timeout: 15000, headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)' } }, (res) => { if ([301, 302, 303, 307, 308].includes(res.statusCode) && res.headers.location) { const nextUrl = new URL(res.headers.location, urlStr).href; res.resume(); return downloadUrlBuffer(nextUrl).then(resolve).catch(reject); } if (res.statusCode !== 200) { res.resume(); return reject(new Error(`HTTP ${res.statusCode}`));
+        }
+        const chunks = [];
+        res.on('data', (c) => chunks.push(c));
+        res.on('end', () => resolve(Buffer.concat(chunks)));
+      }
+    );
+    req.on('error', reject);
+    req.on('timeout', () => {
+      req.destroy();
+      reject(new Error('Timeout'));
+    });
+  });
+}
+
+async function downloadWithMirrors(rawUrl) {
+  const candidates = Array.isArray(rawUrl) ? rawUrl : buildMirrorCandidates(rawUrl);
+  let lastErr = null;
+  for (const candidate of candidates) {
+    try {
+      const buf = await downloadUrlBuffer(candidate);
+      if (buf && buf.length > 64) return buf;
+    } catch (e) {
+      lastErr = e;
+    }
+  }
+  throw lastErr || new Error('All mirrors failed');
+}
+
+async function ensureCensorDatabase(forceUpdate = false) {
+  if (!forceUpdate && fs.existsSync(localListPath)) {
+    try {
+      const stat = fs.statSync(localListPath);
+      if (stat.size > 100) return true;
+    } catch (e) {}
+  }
+  try {
+    const buf = await downloadWithMirrors(LIST_MIRRORS);
+    const txt = buf.toString('utf-8');
+    JSON.parse(txt);
+    fs.writeFileSync(localListPath, txt, 'utf-8');
+    return true;
+  } catch (e) {
+    console.error('Failed to download list_v2.json:', e.message);
+    return fs.existsSync(localListPath);
+  }
+}
+
+// Локальный микро-сервер для раздачи чистых MP3 с поддержкой перемотки (HTTP 206 Partial Content)
+let localAudioServerPort = 0;
+const remoteTrackUrlMap = new Map();
+
+function startLocalAudioServer() {
+  return new Promise((resolve) => {
+    const server = http.createServer(async (req, res) => {
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, HEAD, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', '*');
+
+      if (req.method === 'OPTIONS') {
+        res.writeHead(204);
+        return res.end();
+      }
+
+      try {
+        const parsed = new URL(req.url, 'http://127.0.0.1');
+        const match = parsed.pathname.match(/^\/track\/([0-9A-Za-z_-]+)\.mp3$/);
+        if (!match) {
+          res.writeHead(404);
+          return res.end('Not found');
+        }
+
+        const trackId = match[1];
+        const cachedFile = path.join(audioCacheDir, `${trackId}.mp3`); let audioBuffer = null;  // 1. Если MP3 уже есть на диске — берём мгновенно с диска if (fs.existsSync(cachedFile) && fs.statSync(cachedFile).size > 1024) { audioBuffer = fs.readFileSync(cachedFile); } else { // 2. Иначе скачиваем через зеркала и сохраняем в кэш на ПК const remoteUrl = parsed.searchParams.get('src') \vert{}\vert{} remoteTrackUrlMap.get(trackId); if (!remoteUrl) { res.writeHead(404); return res.end('No remote source'); } audioBuffer = await downloadWithMirrors(remoteUrl); if (audioBuffer && audioBuffer.length > 1024) { try { fs.writeFileSync(cachedFile, audioBuffer); } catch (e) {} } }  if (!audioBuffer \vert{}\vert{} audioBuffer.length === 0) { res.writeHead(500); return res.end('Empty audio'); }  const total = audioBuffer.length; const range = req.headers.range;  if (range) { const parts = range.replace(/bytes=/, '').split('-'); const start = parseInt(parts[0], 10) \vert{}\vert{} 0; const end = parts[1] ? parseInt(parts[1], 10) : total - 1; const chunk = audioBuffer.subarray(start, end + 1);  res.writeHead(206, { 'Content-Range': `bytes ${start}-${end}/${total}`,
+            'Accept-Ranges': 'bytes',
+            'Content-Length': chunk.length,
+            'Content-Type': 'audio/mpeg'
+          });
+          return res.end(chunk);
+        } else {
+          res.writeHead(200, {
+            'Accept-Ranges': 'bytes',
+            'Content-Length': total,
+            'Content-Type': 'audio/mpeg'
+          });
+          return res.end(audioBuffer);
+        }
+      } catch (err) {
+        console.error('Audio server error:', err.message);
+        res.writeHead(502);
+        res.end('Audio fetch error');
+      }
+    });
+
+    server.listen(0, '127.0.0.1', () => {
+      localAudioServerPort = server.address().port;
+      resolve(localAudioServerPort);
+    });
+  });
+}
+
+function loadConfig() {
+  try {
+    if (fs.existsSync(configPath)) {
+      return JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    }
+  } catch (e) {}
+  return {};
+}
+
+function saveConfig(data) {
+  try {
+    const current = loadConfig();
+    const updated = { ...current, ...data };
+    fs.writeFileSync(configPath, JSON.stringify(updated, null, 2), 'utf-8');
+    return updated;
+  } catch (e) {}
+}
+
+function findWorkshopDirs() {
+  const candidates = new Set([
+    'C:\\Program Files (x86)\\Steam',
+    'C:\\Program Files\\Steam',
+    'C:\\Steam',
+    'D:\\Steam',
+    'D:\\SteamLibrary',
+    'E:\\Steam',
+    'E:\\SteamLibrary',
+    'F:\\SteamLibrary'
+  ]);
+
+  for (const base of Array.from(candidates)) {
+    const vdfPath = path.join(base, 'steamapps', 'libraryfolders.vdf');
+    if (fs.existsSync(vdfPath)) {
+      try {
+        const content = fs.readFileSync(vdfPath, 'utf-8');
+        const matches = content.matchAll(/"path"\s+"([^"]+)"/g);
+        for (const m of matches) {
+          candidates.add(m[1].replace(/\\\\/g, '\\'));
+        }
+      } catch (e) {}
+    }
+  }
+
+  const workshopDirs = [];
+  for (const lib of candidates) {
+    const weDir = path.join(lib, 'steamapps', 'workshop', 'content', '431960');
+    if (fs.existsSync(weDir)) workshopDirs.push(weDir);
+  }
+  return workshopDirs;
+}
+
+function scanAllWallpapers() {
+  const items = [];
+  let weCount = 0;
+  let customCount = 0;
+
+  const weDirs = findWorkshopDirs();
+  for (const weDir of weDirs) {
+    try {
+      const folders = fs.readdirSync(weDir, { withFileTypes: true });
+      for (const dir of folders) {
+        if (!dir.isDirectory()) continue;
+        const itemPath = path.join(weDir, dir.name);
+        const projFile = path.join(itemPath, 'project.json');
+
+        let title = `Wallpaper ${dir.name}`; let videoFile = null; let previewFile = null;  if (fs.existsSync(projFile)) { try { const proj = JSON.parse(fs.readFileSync(projFile, 'utf-8')); if (proj.title) title = proj.title; if (proj.file) { const candidate = path.join(itemPath, proj.file); if (fs.existsSync(candidate) && /\.(mp4\vert{}webm)$/i.test(proj.file)) { videoFile = candidate; } } if (proj.preview) { const pCandidate = path.join(itemPath, proj.preview); if (fs.existsSync(pCandidate)) previewFile = pCandidate; } } catch (e) {} }  if (!videoFile) { const files = fs.readdirSync(itemPath); const foundVid = files.find((f) => /\.(mp4\vert{}webm)$/i.test(f)); if (foundVid) videoFile = path.join(itemPath, foundVid); if (!previewFile) { const foundPrev = files.find((f) => /^preview\.(jpg\vert{}jpeg\vert{}gif\vert{}png\vert{}webp)$/i.test(f)); if (foundPrev) previewFile = path.join(itemPath, foundPrev); } }  if (videoFile) { weCount++; items.push({ id: `we_${dir.name}`,
+            title,
+            source: 'we',
+            videoUrl: pathToFileURL(videoFile).href,
+            previewUrl: previewFile ? pathToFileURL(previewFile).href : null
+          });
+        }
+      }
+    } catch (e) {}
+  }
+
+  if (fs.existsSync(customWallpapersDir)) {
+    try {
+      const files = fs.readdirSync(customWallpapersDir);
+      for (const f of files) {
+        if (/\.(mp4|webm)$/i.test(f)) {
+          customCount++;
+          const fullPath = path.join(customWallpapersDir, f);
+          items.push({
+            id: `custom_${f}`, title: path.parse(f).name, source: 'custom', videoUrl: pathToFileURL(fullPath).href, previewUrl: null }); } } } catch (e) {} }  return { weCount, customCount, items }; }  let mainWindow;  async function createWindow() { await startLocalAudioServer(); await ensureCensorDatabase(false);  session.defaultSession.webRequest.onHeadersReceived((details, callback) => { const headers = { ...details.responseHeaders }; delete headers['content-security-policy']; delete headers['content-security-policy-report-only']; delete headers['Content-Security-Policy']; callback({ cancel: false, responseHeaders: headers }); });  const iconCandidate = path.join(__dirname, 'src/assets/ym/favicon.ico');  mainWindow = new BrowserWindow({ width: 1400, height: 860, minWidth: 960, minHeight: 640, frame: false, backgroundColor: '#000000', icon: fs.existsSync(iconCandidate) ? iconCandidate : undefined, webPreferences: { preload: path.join(__dirname, 'preload.js'), contextIsolation: false, nodeIntegration: false, sandbox: false, webSecurity: false } });  mainWindow.webContents.setWindowOpenHandler(({ url }) => { if (url.includes('yandex.') \vert{}\vert{} url.includes('oauth')) { return { action: 'allow', overrideBrowserWindowOptions: { width: 480, height: 680, autoHideMenuBar: true } }; } return { action: 'deny' }; });  mainWindow.loadURL('https://music.yandex.ru/'); }  app.whenReady().then(createWindow);  app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit(); });  ipcMain.on('window:minimize', () => mainWindow.minimize()); ipcMain.on('window:maximize', () => { mainWindow.isMaximized() ? mainWindow.unmaximize() : mainWindow.maximize(); }); ipcMain.on('window:close', () => mainWindow.close());  ipcMain.on('censor:getInitSync', (event) => { event.returnValue = { port: localAudioServerPort, censorDir, audioCacheDir, localListPath }; });  ipcMain.on('censor:registerTracks', (event, entries) => { if (Array.isArray(entries)) { for (const [id, url] of entries) { remoteTrackUrlMap.set(String(id), String(url)); } } });  ipcMain.handle('censor:syncDatabase', async () => { return await ensureCensorDatabase(true); });  ipcMain.handle('censor:openAudioFolder', () => shell.openPath(audioCacheDir)); ipcMain.handle('config:get', () => loadConfig()); ipcMain.handle('config:set', (e, data) => saveConfig(data)); ipcMain.handle('wallpaper:scan', () => scanAllWallpapers()); ipcMain.handle('wallpaper:openFolder', () => shell.openPath(customWallpapersDir)); ```  ---  ### 2. Замени `censor-bypass.js` целиком (`Ctrl + A` -> `Delete` -> `Ctrl + V`) Убедись, что файл **`censor-bypass.js`** лежит в папке **`nebula-player`** рядом с `main.js` и `preload.js`:  ```javascript const fs = require('fs'); const path = require('path'); const { ipcRenderer } = require('electron');  (function initStandaloneFckCensor() { if (location.hostname.includes('passport.yandex') \vert{}\vert{} location.hostname.includes('oauth.yandex')) { return; }  // Получаем порт локального аудио-сервера и пути синхронно до загрузки скриптов Яндекса const initData = ipcRenderer.sendSync('censor:getInitSync'); const { port: audioPort, censorDir, audioCacheDir, localListPath } = initData; const settingsPath = path.join(censorDir, 'censor-settings.json'); const DISCLAIMER_CENSOR_ID = '65256e7f0ec8594f3459e3fa';  let cfg = { enabled: true, spoofMeta: true }; try { if (fs.existsSync(settingsPath)) { cfg = { ...cfg, ...JSON.parse(fs.readFileSync(settingsPath, 'utf-8')) }; } } catch (e) {}  function saveCfg(patch) { Object.assign(cfg, patch); try { fs.writeFileSync(settingsPath, JSON.stringify(cfg, null, 2), 'utf-8'); } catch (e) {} updateStatusUI(); }  const trackSpoofs = new Map(); const albumSpoofs = new Map(); const artistSpoofs = new Map(); const remoteAudioUrls = new Map(); const localAudioIds = new Set();  let currentPlayingTrackId = null; let currentlyUncensoredTrackId = null;  function ensureHttps(url) { if (typeof url !== 'string' \vert{}\vert{} !url) return ''; if (url.includes('://')) return url; return 'https://' + url; }  function normalizeCoverUri(uri) { if (typeof uri !== 'string' \vert{}\vert{} !uri) return uri; return uri.replace(/^https?:\/\//i, ''); }  function scanLocalAudioFolder() { localAudioIds.clear(); try { const files = fs.readdirSync(audioCacheDir); for (const f of files) { if (/\.(mp3\vert{}flac\vert{}wav\vert{}ogg\vert{}m4a)$/i.test(f)) { const full = path.join(audioCacheDir, f); if (fs.statSync(full).size > 1024) { localAudioIds.add(path.parse(f).name.trim()); } } } } catch (e) {} }  function parseDatabaseJson(raw) { if (!raw \vert{}\vert{} !Array.isArray(raw.sources)) return false;  trackSpoofs.clear(); albumSpoofs.clear(); artistSpoofs.clear(); remoteAudioUrls.clear();  for (const src of raw.sources) { if (src.tracks && typeof src.tracks === 'object') { for (const [id, data] of Object.entries(src.tracks)) { if (!trackSpoofs.has(String(id))) trackSpoofs.set(String(id), { ...data }); } } if (src.albums && typeof src.albums === 'object') { for (const [id, data] of Object.entries(src.albums)) { if (!albumSpoofs.has(String(id))) albumSpoofs.set(String(id), { ...data }); } } if (src.artists && typeof src.artists === 'object') { for (const [id, data] of Object.entries(src.artists)) { if (!artistSpoofs.has(String(id))) artistSpoofs.set(String(id), { ...data }); } }  if (Array.isArray(src.tracksStorages)) { for (const st of src.tracksStorages) { const resolveTpl = (val) => { if ((typeof val === 'number' \vert{}\vert{} (typeof val === 'string' && !val.includes('://'))) && st.urlTemplate) { return st.urlTemplate.replace('\%\%', String(val)); } return val; };  if (Array.isArray(st.trackIds)) { for (const item of st.trackIds) { const id = String(typeof item === 'number' ? item : item.id); const dur = typeof item === 'number' ? undefined : item.durationMs; if (dur !== undefined) { const prev = trackSpoofs.get(id) \vert{}\vert{} {}; trackSpoofs.set(id, { ...prev, durationMs: dur }); } if (st.urlTemplate && !remoteAudioUrls.has(id)) { remoteAudioUrls.set(id, ensureHttps(st.urlTemplate.replace('\%\%', id))); } } }  if (st.tracks && typeof st.tracks === 'object') { for (const [id, val] of Object.entries(st.tracks)) { let url, dur; if (typeof val === 'object' && val !== null) { url = resolveTpl(val.url !== undefined ? val.url : id); dur = val.durationMs; } else { url = resolveTpl(val); } if (url && !remoteAudioUrls.has(String(id))) { remoteAudioUrls.set(String(id), ensureHttps(String(url))); } if (typeof dur === 'number') { const prev = trackSpoofs.get(String(id)) \vert{}\vert{} {}; trackSpoofs.set(String(id), { ...prev, durationMs: dur }); } } } } } }  for (const alb of albumSpoofs.values()) { if (Array.isArray(alb.volumes) && alb.coverUri) { alb.volumes.flat().forEach((t) => { const tid = String(t?.id ?? t); const tr = trackSpoofs.get(tid); if (tr && !tr.coverUri) tr.coverUri = alb.coverUri; }); } }  ipcRenderer.send('censor:registerTracks', Array.from(remoteAudioUrls.entries())); updateStatusUI(); return true; }  function loadLocalDatabaseSync() { scanLocalAudioFolder(); if (fs.existsSync(localListPath)) { try { const raw = JSON.parse(fs.readFileSync(localListPath, 'utf-8')); return parseDatabaseJson(raw); } catch (e) {} } return false; }  function hasAudioReplacement(trackId) { const id = String(trackId).split(':')[0]; return localAudioIds.has(id) \vert{}\vert{} remoteAudioUrls.has(id); }  function buildLocalStreamUrl(trackId) { const id = String(trackId).split(':')[0]; const remote = remoteAudioUrls.get(id) \vert{}\vert{} ''; return `http://127.0.0.1:${audioPort}/track/${id}.mp3?src=${encodeURIComponent(remote)}`;
+  }
+
+  // Подмена метаданных в объектах треков, альбомов и артистов
+  function spoofArtistObject(artist) {
+    if (!artist || typeof artist !== 'object' || artist.id === undefined) return;
+    const sp = artistSpoofs.get(String(artist.id));
+    if (!sp) return;
+    if (sp.name) artist.name = sp.name;
+    if (sp.coverUri) {
+      const cleanUri = normalizeCoverUri(sp.coverUri);
+      artist.coverUri = cleanUri;
+      artist.ogImage = cleanUri;
+      artist.cover = { ...(artist.cover || {}), type: 'from-artist-photos', uri: cleanUri, prefix: 'fck' };
+    }
+    artist.available = true;
+  }
+
+  function spoofAlbumObject(album) {
+    if (!album || typeof album !== 'object' || album.id === undefined) return;
+    const sp = albumSpoofs.get(String(album.id));
+    if (sp) {
+      if (sp.title) album.title = sp.title;
+      if ('version' in sp) album.version = sp.version;
+      if (sp.year !== undefined) album.year = sp.year;
+      if (sp.coverUri) {
+        const cleanUri = normalizeCoverUri(sp.coverUri);
+        album.coverUri = cleanUri;
+        album.ogImage = cleanUri;
+        album.cover = { ...(album.cover || {}), type: 'from-album-cover', uri: cleanUri, prefix: 'fck' };
+      }
+      album.available = true;
+      album.availableForPremiumUsers = true;
+    }
+    if (Array.isArray(album.artists)) album.artists.forEach(spoofArtistObject);
+    if (Array.isArray(album.volumes)) {
+      album.volumes.forEach((vol) => Array.isArray(vol) && vol.forEach(spoofTrackObject));
+    }
+  }
+
+  function spoofTrackObject(track) {
+    if (!track || typeof track !== 'object' || track.id === undefined) return;
+    const id = String(track.id).split(':')[0];
+    const sp = trackSpoofs.get(id);
+    const hasAudio = hasAudioReplacement(id);
+
+    if (hasAudio || sp) {
+      track.available = true;
+      track.availableForPremiumUsers = true;
+      track.availableFullWithoutPermission = true;
+      delete track.error;
+      if (Array.isArray(track.disclaimers)) {
+        track.disclaimers = track.disclaimers.filter((d) => !String(d).includes(DISCLAIMER_CENSOR_ID));
+      }
+    }
+
+    if (sp) {
+      if (sp.title) track.title = sp.title;
+      if (sp.name) track.name = sp.name;
+      if ('version' in sp) track.version = sp.version;
+      if (typeof sp.durationMs === 'number') track.durationMs = sp.durationMs;
+      if (sp.coverUri) {
+        const cleanUri = normalizeCoverUri(sp.coverUri);
+        track.coverUri = cleanUri;
+        track.ogImage = cleanUri;
+      }
+      if (Array.isArray(sp.artists) && sp.artists.length > 0) {
+        track.artists = sp.artists.map((a) => ({
+          id: Number(a.id) || a.id,
+          name: String(a.name || 'Без имени'),
+          various: Boolean(a.various),
+          composer: false,
+          available: true,
+          ...(a.coverUri
+            ? { cover: { type: 'from-artist-photos', uri: normalizeCoverUri(a.coverUri), prefix: 'fck' } }
+            : {})
+        }));
+      }
+    }
+
+    if (Array.isArray(track.artists)) track.artists.forEach(spoofArtistObject);
+    if (Array.isArray(track.albums)) {
+      track.albums.forEach((alb) => {
+        spoofAlbumObject(alb);
+        if (!track.coverUri && (alb.coverUri || alb.cover?.uri)) {
+          track.coverUri = normalizeCoverUri(alb.coverUri || alb.cover.uri);
+          track.ogImage = track.coverUri;
+        }
+      });
+    }
+  }
+
+  function walkAndSpoofJson(node, visited = new WeakSet(), depth = 0) {
+    if (!node || typeof node !== 'object' || depth > 14 || visited.has(node)) return;
+    visited.add(node);
+
+    if (Array.isArray(node)) {
+      for (let i = 0; i < node.length; i++) walkAndSpoofJson(node[i], visited, depth + 1);
+      return;
+    }
+
+    if (node.id !== undefined) {
+      if (
+        'durationMs' in node ||
+        'storageDir' in node ||
+        'trackSource' in node ||
+        'realId' in node ||
+        Array.isArray(node.albums)
+      ) {
+        spoofTrackObject(node);
+      } else if ('volumes' in node || 'trackCount' in node) {
+        spoofAlbumObject(node);
+      } else if ('name' in node && ('counts' in node || 'various' in node || 'composer' in node)) {
+        spoofArtistObject(node);
+      }
+    }
+
+    for (const key of Object.keys(node)) {
+      const val = node[key];
+      if (val && typeof val === 'object') walkAndSpoofJson(val, visited, depth + 1);
+    }
+  }
+
+  // Формируем ответ /get-file-info с разблокированным потоком transport: 'raw'
+  function buildRawDownloadInfoResponse(cleanId, originalData = null) {
+    const streamUrl = buildLocalStreamUrl(cleanId);
+    const isCached = localAudioIds.has(cleanId);
+    const sp = trackSpoofs.get(cleanId);
+    const label = sp?.title ? `«${sp.title}»` : `ID ${cleanId}`;
+
+    currentlyUncensoredTrackId = cleanId;
+    showMiniToast(`🔓 Без цензуры ${isCached ? '(Кэш ПК)' : '(Подмена)'}: ${label}`);
+    updateUncensoredBadge(true, isCached);
+    setTimeout(scanLocalAudioFolder, 4000);
+
+    const dl = {
+      ...(originalData?.result?.downloadInfo || {}),
+      trackId: String(cleanId),
+      realId: String(cleanId),
+      quality: 'normal',
+      codec: 'mp3',
+      bitrate: 320,
+      transport: 'raw',
+      gain: 0,
+      url: streamUrl,
+      urls: [streamUrl]
+    };
+    delete dl.key;
+    delete dl.sign;
+    delete dl.size;
+
+    return {
+      invocationInfo: originalData?.invocationInfo || {
+        'req-id': 'fckcensor-local',
+        hostname: 'nebula-local',
+        'exec-duration-millis': 1
+      },
+      result: {
+        ...(originalData?.result || {}),
+        downloadInfo: dl
+      }
+    };
+  }
+
+  // 1. Перехватчик window.fetch
+  const origFetch = window.fetch.bind(window);
+
+  window.fetch = async function (input, init) {
+    const urlStr =
+      typeof input === 'string'
+        ? input
+        : input instanceof URL
+        ? input.href
+        : (input && input.url) || String(input);
+
+    if (!cfg.enabled) {
+      return origFetch(input, init);
+    }
+
+    // Перехват запроса аудиопотока /get-file-info
+    if (urlStr.includes('/get-file-info')) {
+      try {
+        const parsedUrl = new URL(urlStr, location.origin);
+        const rawTrackId =
+          parsedUrl.searchParams.get('trackId') ||
+          parsedUrl.searchParams.get('track-id') ||
+          '';
+        const cleanId = rawTrackId.split(':')[0];
+        if (cleanId) currentPlayingTrackId = cleanId;
+
+        if (cleanId && hasAudioReplacement(cleanId)) {
+          let origJson = null;
+          try {
+            const origRes = await origFetch(input, init);
+            if (origRes.ok) origJson = await origRes.json();
+          } catch (e) {}
+
+          const replacedPayload = buildRawDownloadInfoResponse(cleanId, origJson);
+          return new Response(JSON.stringify(replacedPayload), {
+            status: 200,
+            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+          });
+        } else {
+          currentlyUncensoredTrackId = null;
+          updateUncensoredBadge(false, false);
+        }
+      } catch (e) {}
+    }
+
+    const response = await origFetch(input, init);
+
+    if (cfg.spoofMeta) {
+      const ct = (response.headers && response.headers.get('content-type')) || '';
+      if (ct.includes('application/json')) {
+        try {
+          const clone = response.clone();
+          const data = await clone.json();
+          walkAndSpoofJson(data);
+          return new Response(JSON.stringify(data), {
+            status: response.status,
+            statusText: response.statusText,
+            headers: { 'Content-Type': 'application/json; charset=utf-8' }
+          });
+        } catch (e) {
+          return response;
+        }
+      }
+    }
+
+    return response;
+  };
+
+  // 2. Перехватчик XMLHttpRequest (на случай запросов через XHR)
+  const origXhrOpen = XMLHttpRequest.prototype.open;
+  const origXhrSend = XMLHttpRequest.prototype.send;
+
+  XMLHttpRequest.prototype.open = function (method, url, ...rest) {
+    this._fckUrl = typeof url === 'string' ? url : String(url);
+    return origXhrOpen.call(this, method, url, ...rest);
+  };
+
+  XMLHttpRequest.prototype.send = function (...args) {
+    this.addEventListener('readystatechange', function () {
+      if (this.readyState === 4 && cfg.enabled && this.status === 200) {
+        try {
+          const urlStr = this._fckUrl || '';
+          const ct = this.getResponseHeader('content-type') || '';
+          if (!ct.includes('application/json')) return;
+
+          let data = JSON.parse(this.responseText);
+          if (urlStr.includes('/get-file-info')) {
+            const parsedUrl = new URL(urlStr, location.origin);
+            const rawTrackId = parsedUrl.searchParams.get('trackId') || '';
+            const cleanId = rawTrackId.split(':')[0];
+            if (cleanId && hasAudioReplacement(cleanId)) {
+              data = buildRawDownloadInfoResponse(cleanId, data);
+            }
+          } else if (cfg.spoofMeta) {
+            walkAndSpoofJson(data);
+          }
+
+          const modifiedText = JSON.stringify(data);
+          Object.defineProperty(this, 'responseText', { value: modifiedText, configurable: true });
+          Object.defineProperty(this, 'response', { value: modifiedText, configurable: true });
+        } catch (e) {}
+      }
+    });
+    return origXhrSend.apply(this, args);
+  };
+
+  // 3. Живая доводка названия трека и автора в DOM (если трек уже был закэширован плеером)
+  function syncDomTitlesWithSpoof() {
+    if (!cfg.enabled || !cfg.spoofMeta || !currentPlayingTrackId) return;
+    const sp = trackSpoofs.get(String(currentPlayingTrackId));
+    if (!sp) return;
+
+    if (sp.title) {
+      document
+        .querySelectorAll(
+          '[class*="VibePlayerbarTrackName_"], [class*="VibePlayerbarTimecodeContent_trackName"], [class*="PlayerBarDesktopWithBackgroundProgressBar_meta"] [class*="Meta_title"]'
+        )
+        .forEach((el) => {
+          if (el.textContent && el.textContent !== sp.title) {
+            el.textContent = sp.title;
+          }
+        });
+    }
+
+    if (Array.isArray(sp.artists) && sp.artists.length > 0) {
+      const artistNames = sp.artists.map((a) => a.name).filter(Boolean).join(', ');
+      if (artistNames) {
+        document
+          .querySelectorAll('[class*="VibeDynamicArtists_root"], [data-ym-part="vibe-artist"]')
+          .forEach((el) => {
+            if (el.textContent && el.textContent !== 'Моя волна' && el.textContent !== artistNames) {
+              el.textContent = artistNames;
+            }
+          });
+      }
+    }
+  }
+
+  // 4. Панель управления и уведомления
+  function showMiniToast(text) {
+    let toast = document.getElementById('ym-fck-toast');
+    if (!toast) {
+      toast = document.createElement('div');
+      toast.id = 'ym-fck-toast';
+      toast.style.cssText = `
+        position: fixed; top: 44px; right: 18px; z-index: 2147483647;
+        padding: 8px 14px; border-radius: 12px;
+        background: rgba(20, 16, 32, 0.9); backdrop-filter: blur(18px);
+        border: 1px solid rgba(192, 132, 252, 0.55);
+        box-shadow: 0 10px 30px rgba(0,0,0,0.65);
+        color: #fff; font-family: 'YSText', 'Segoe UI', sans-serif;
+        font-size: 12px; font-weight: 600; pointer-events: none;
+        transition: opacity 0.25s ease, transform 0.25s ease;
+        opacity: 0; transform: translateY(-8px);
+      `;
+      document.documentElement.appendChild(toast);
+    }
+    toast.textContent = text;
+    toast.style.opacity = '1';
+    toast.style.transform = 'translateY(0)';
+    clearTimeout(toast._timer);
+    toast._timer = setTimeout(() => {
+      toast.style.opacity = '0';
+      toast.style.transform = 'translateY(-8px)';
+    }, 3500);
+  }
+
+  function updateUncensoredBadge(active, isLocal) {
+    let badge = document.getElementById('ym-fck-active-badge');
+    if (!active) {
+      if (badge) badge.style.display = 'none';
+      return;
+    }
+    const capsule = document.querySelector('[class*="VibePlayerbarTimecodeContent_center"]');
+    if (!capsule) return;
+
+    if (!badge) {
+      badge = document.createElement('span');
+      badge.id = 'ym-fck-active-badge';
+      badge.style.cssText = `
+        margin-left: 8px; padding: 2px 7px; border-radius: 6px;
+        background: linear-gradient(135deg, rgba(147,51,234,0.75), rgba(74,222,128,0.55));
+        border: 1px solid rgba(255,255,255,0.4);
+        color: #fff; font-size: 10px; font-weight: 800;
+        pointer-events: none; white-space: nowrap;
+      `;
+    }
+    badge.textContent = isLocal ? '🔓 RAW • ПК' : '🔓 RAW';
+    badge.style.display = 'inline-block';
+    if (!capsule.contains(badge)) capsule.appendChild(badge);
+  }
+
+  function updateStatusUI() {
+    const statEl = document.getElementById('fck-stat-line');
+    if (statEl) {
+      statEl.textContent = `В базе: ${remoteAudioUrls.size} аудио, ${trackSpoofs.size} треков \vert{} Кэш MP3 на ПК: ${localAudioIds.size}`;
+    }
+    const toggleBtn = document.getElementById('fck-btn-toggle');
+    if (toggleBtn) {
+      toggleBtn.textContent = cfg.enabled ? '🛡️ Антицензура: ВКЛ' : '🛡️ Антицензура: ВЫКЛ';
+      toggleBtn.style.background = cfg.enabled
+        ? 'linear-gradient(135deg, #9333ea, #a855f7)'
+        : 'rgba(255,255,255,0.08)';
+    }
+  }
+
+  function mountControlPanelIntoModal() {
+    const modal = document.getElementById('ym-wp-modal');
+    if (!modal || document.getElementById('ym-fck-panel')) return;
+
+    const panel = document.createElement('div');
+    panel.id = 'ym-fck-panel';
+    panel.className = 'wp-section-box hide-on-peek';
+    panel.innerHTML = `
+      <div class="wp-sec-title">
+        <span>🛡️ Антицензура FckCensor (Автономный модуль)</span>
+        <span id="fck-stat-line" style="font-size:11px;color:#4ade80">Загрузка базы...</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;">
+        <button class="wp-act-btn" id="fck-btn-toggle"></button>
+        <button class="wp-act-btn" id="fck-btn-sync">🔄 Обновить базу (через зеркало CDN)</button>
+        <button class="wp-act-btn" id="fck-btn-folder">📁 Папка кэша MP3</button>
+      </div>
+    `;
+
+    const header = modal.querySelector('.wp-m-header');
+    if (header && header.nextSibling) {
+      modal.insertBefore(panel, header.nextSibling);
+    } else {
+      modal.prepend(panel);
+    }
+
+    panel.querySelector('#fck-btn-toggle').addEventListener('click', () => {
+      saveCfg({ enabled: !cfg.enabled });
+    });
+    panel.querySelector('#fck-btn-sync').addEventListener('click', async () => {
+      showMiniToast('⏳ Скачиваем свежую базу через CDN-зеркало...');
+      const ok = await ipcRenderer.invoke('censor:syncDatabase');
+      loadLocalDatabaseSync();
+      showMiniToast(
+        ok
+          ? `🛡️ База обновлена: ${remoteAudioUrls.size} аудио, ${trackSpoofs.size} треков`
+          : '⚠️ Ошибка обновления базы'
+      );
+    });
+    panel.querySelector('#fck-btn-folder').addEventListener('click', () => {
+      ipcRenderer.invoke('censor:openAudioFolder');
+    });
+
+    updateStatusUI();
+  }
+
+  // Синхронно загружаем базу прямо на старте ДО скриптов Яндекс Музыки
+  loadLocalDatabaseSync();
+
+  setInterval(() => {
+    mountControlPanelIntoModal();
+    syncDomTitlesWithSpoof();
+    if (currentlyUncensoredTrackId) {
+      updateUncensoredBadge(true, localAudioIds.has(currentlyUncensoredTrackId));
+    }
+  }, 400);
+})();
+
+=== FILE: src\core\apiClient.js ===
+const crypto = require('crypto');
+
+const API_BASE = 'https://api.music.yandex.net';
+const SIGN_SALT = 'XGRlBW9FXlekgbPrRHuSiA';
+
+function getHeaders(token) {
+  return {
+    'Authorization': `OAuth ${token}`,
+    'X-Yandex-Music-Client': 'YandexMusicAndroid/24023621'
+  };
+}
+
+// Забираем очередь треков "Моей волны"
+async function getMyWave(token) {
+  const res = await fetch(`${API_BASE}/rotor/station/user:onyourwave/tracks?settings2=true`, {
+    headers: getHeaders(token)
+  });
+  const data = await res.json();
+  if (!data.result || !data.result.sequence) throw new Error('Ошибка получения волны');
+
+  return data.result.sequence.map(item => {
+    const t = item.track;
+    return {
+      id: t.id,
+      title: t.title,
+      artist: t.artists ? t.artists.map(a => a.name).join(', ') : 'Неизвестен',
+      cover: t.coverUri ? `https://${t.coverUri.replace('%%', '400x400')}` : ''
+    };
+  });
+}
+
+// Вытаскиваем прямую MP3-ссылку на аудиопоток
+async function getTrackUrl(token, trackId) {
+  const infoRes = await fetch(`${API_BASE}/tracks/${trackId}/download-info`, {
+    headers: getHeaders(token)
+  });
+  const infoData = await infoRes.json();
+
+  const best = infoData.result
+    .filter(x => x.codec === 'mp3')
+    .sort((a, b) => b.bitrateInKbps - a.bitrateInKbps)[0] || infoData.result[0];
+
+  const dlRes = await fetch(`${best.downloadInfoUrl}&format=json`, {
+    headers: getHeaders(token)
+  });
+  const dl = await dlRes.json();
+
+  const sign = crypto
+    .createHash('md5')
+    .update(SIGN_SALT + dl.path.slice(1) + dl.s)
+    .digest('hex');
+
+  return `https://${dl.host}/get-mp3/${sign}/${dl.ts}${dl.path}`;
+}
+
+module.exports = { getMyWave, getTrackUrl };
+
+=== FILE: src\player\audioCore.js ===
+class AudioCore {
+  constructor() {
+    this.audio = new Audio();
+    this.audio.crossOrigin = 'anonymous';
+    this.audio.volume = 0.5;
+  }
+
+  playUrl(url) {
+    this.audio.src = url;
+    return this.audio.play();
+  }
+
+  toggle() {
+    if (!this.audio.src) return false;
+    if (this.audio.paused) {
+      this.audio.play();
+      return true;
+    } else {
+      this.audio.pause();
+      return false;
+    }
+  }
+
+  setVolume(val) {
+    this.audio.volume = Math.max(0, Math.min(1, val));
+  }
+
+  seek(percent) {
+    if (this.audio.duration) {
+      this.audio.currentTime = (percent / 100) * this.audio.duration;
+    }
+  }
+
+  onTimeUpdate(callback) {
+    this.audio.addEventListener('timeupdate', () => {
+      const progress = this.audio.duration ? (this.audio.currentTime / this.audio.duration) * 100 : 0;
+      callback(progress, this.audio.currentTime, this.audio.duration || 0);
+    });
+  }
+
+  onEnded(callback) {
+    this.audio.addEventListener('ended', callback);
+  }
+}
+
+window.audioCore = new AudioCore();
+
+=== FILE: src\ui\index.html ===
+<!DOCTYPE html>
+<html lang="ru" class="ym-dark-theme">
+<head>
+  <meta charset="UTF-8">
+  <title>Яндекс Музыка</title>
+  <link rel="stylesheet" href="../assets/ym/ym-bundle.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Инжект оригинального sprite.svg -->
+  <div id="svgSpriteContainer" style="display: none;"></div>
+
+  <!-- СЛОИ ЖИВЫХ ОБОЕВ (РАБОТАЮТ СРАЗУ) -->
+  <div id="bgImage" class="bg-layer bg-image hidden"></div>
+  <video id="bgVideo" class="bg-layer bg-video" src="../assets/ym/media/vibe_animation_fallback/vibe_animation_fallback_dark.mp4" loop muted autoplay playsinline></video>
+  <canvas id="bgCanvas" class="bg-layer bg-canvas"></canvas>
+  <div id="bgDimmer" class="bg-layer bg-dimmer"></div>
+
+  <!-- Скрытый инпут для мгновенной загрузки любых видео и фото обоев -->
+  <input type="file" id="wallpaperInput" accept="video/mp4,video/webm,image/jpeg,image/png,image/webp,image/gif" class="hidden">
+
+  <!-- Верхний системный TitleBar -->
+  <header class="ym-titlebar">
+    <div class="ym-titlebar-drag"></div>
+    <div class="ym-window-controls">
+      <button class="ym-win-btn" id="minBtn" title="Свернуть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect y="4.5" width="10" height="1" fill="currentColor"/></svg>
+      </button>
+      <button class="ym-win-btn" id="maxBtn" title="Развернуть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" stroke="currentColor" stroke-width="1" fill="none"/></svg>
+      </button>
+      <button class="ym-win-btn close" id="closeBtn" title="Закрыть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ГЛАВНЫЙ КАРКАС 5.126.1 -->
+  <div class="ym-app-shell" id="appShell">
+
+    <!-- ЛЕВЫЙ САЙДБАР -->
+    <aside class="ym-sidebar">
+      <div class="ym-sidebar-header">
+        <div class="ym-brand-logo" data-nav="vibe">
+          <svg width="136" height="28" class="ym-logo-icon"><use href="#musicLogoLeftRu"></use></svg>
+        </div>
+        <button class="ym-collapse-btn" title="Свернуть меню">
+          <svg width="14" height="14"><use href="#arrowLeft_xxs"></use></svg>
+        </button>
+      </div>
+
+      <nav class="ym-nav">
+        <button class="ym-nav-btn" data-nav="search">
+          <svg class="ym-nav-ico"><use href="#navigationSearch_xs"></use></svg>
+          <span>Поиск</span>
+        </button>
+        <button class="ym-nav-btn active" data-nav="vibe">
+          <svg class="ym-nav-ico"><use href="#navigationMyVibe_xs"></use></svg>
+          <span>Моя волна</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="trends">
+          <svg class="ym-nav-ico"><use href="#navigationForYouAndTrends_xs"></use></svg>
+          <span>Для вас и Тренды</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="concerts">
+          <svg class="ym-nav-ico"><use href="#navigationConcerts_xs"></use></svg>
+          <span>Концерты</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="podcasts">
+          <svg class="ym-nav-ico"><use href="#navigationNonMusic_xs"></use></svg>
+          <span>Книги и подкасты</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="collection">
+          <svg class="ym-nav-ico"><use href="#navigationCollection_xs"></use></svg>
+          <span>Коллекция</span>
+        </button>
+      </nav>
+
+      <!-- Закрепленные волны как в оригинале -->
+      <div class="ym-pins">
+        <div class="ym-pin-row" data-vibe-mood="Весёлое">
+          <div class="ym-pin-badge pink">
+            <svg width="16" height="16"><use href="#note_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Весёлое</div>
+            <div class="ym-pin-type">Моя волна</div>
+          </div>
+        </div>
+        <div class="ym-pin-row" data-vibe-mood="Грустное">
+          <div class="ym-pin-badge pink">
+            <svg width="16" height="16"><use href="#note_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Грустное</div>
+            <div class="ym-pin-type">Моя волна</div>
+          </div>
+        </div>
+
+        <!-- Быстрая кнопка смены обоев прямо в сайдбаре -->
+        <div class="ym-pin-row" id="quickWallpaperBtn" title="Загрузить видео (.mp4/.webm) или фото">
+          <div class="ym-pin-badge neon">
+            <svg width="16" height="16"><use href="#picture_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Сменить обои</div>
+            <div class="ym-pin-type">Видео / Фото / GIF</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Профиль снизу слева (Антон Радаев + Плюс) -->
+      <div class="ym-profile-bar" id="profileBtn">
+        <img src="../assets/ym/media/avatar.e9a40453.png" class="ym-profile-ava" alt="">
+        <div class="ym-profile-meta">
+          <div class="ym-profile-name">Антон Радаев</div>
+          <div class="ym-plus-pill">
+            <svg width="12" height="12"><use href="#plus"></use></svg>
+            <span>Плюс</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ВСПЛЫВАЮЩЕЕ МЕНЮ ПРОФИЛЯ (со скрина 6) -->
+    <div class="ym-profile-popup hidden" id="profilePopup">
+      <div class="ym-popup-top">
+        <div class="ym-ya-id">Я ID</div>
+        <button class="ym-popup-close" id="closePopupBtn">✕</button>
+      </div>
+      <div class="ym-popup-auth-box" id="popupAuthBox">
+        <div class="ym-popup-auth-title">Аккаунт подключен</div>
+        <div class="ym-popup-auth-sub">Антон Радаев • Подписка Плюс активна</div>
+        <button class="ym-popup-white-btn" id="reloginBtn">Сменить аккаунт</button>
+      </div>
+      <div class="ym-popup-links">
+        <button class="ym-popup-item" id="popupWallpaperBtn">
+          <svg width="18" height="18"><use href="#picture_xs"></use></svg>
+          <span>Выбрать живые обои...</span>
+        </button>
+        <button class="ym-popup-item" data-nav="settings">
+          <svg width="18" height="18"><use href="#settings_xs"></use></svg>
+          <span>Настройки</span>
+        </button>
+        <button class="ym-popup-item" id="toggleGlassBtn">
+          <svg width="18" height="18"><use href="#eye_crossed_xxs"></use></svg>
+          <span>Прозрачность интерфейса</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ПРАВАЯ ГЛАВНАЯ ОБЛАСТЬ (ВСЕ ЭКРАНЫ) -->
+    <main class="ym-stage">
+
+      <!-- ================= ЭКРАН 1: МОЯ ВОЛНА (СКРИН 1) ================= -->
+      <section class="ym-page active" id="page-vibe">
+        <div class="vibe-split-layout">
+          
+          <!-- Левая дуга/колонка быстрых вайбов -->
+          <div class="vibe-agents-list">
+            <div class="vibe-agent-item" data-vibe="Клауд-рэп в дымке">
+              <div class="vibe-agent-ico green">✖</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Клауд-рэп в дымке</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Рэпкор">
+              <div class="vibe-agent-ico blue">⚡</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Рэпкор</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Иностранный рэп и хип-хоп">
+              <div class="vibe-agent-ico teal">A</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Иностранный рэп и хип-хоп на английском</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="В стиле Ghostemane">
+              <img src="../assets/ym/media/artist.d238337d.webp" class="vibe-agent-ava" alt="">
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-sub">В стиле артиста</span>
+                <span class="vibe-agent-title">Ghostemane</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item highlight" id="reshuffleWaveBtn">
+              <div class="vibe-agent-ico yellow-wave">⇄</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title yellow-text">Встряхнуть Мою волну</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-nav="trends">
+              <div class="vibe-agent-ico raspakovka">РАСПА<br>КОВКА</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Артистом года станет... ↗</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Сон зовёт">
+              <div class="vibe-agent-ico sleep">🌙</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Сон зовёт</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Моя волна на двоих">
+              <div class="vibe-agent-ico duo">🃏</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title muted">Моя волна на двоих</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Правая часть: Огромная сфера Моей Волны + капсула трека + жёлтый Play -->
+          <div class="vibe-sphere-stage">
+            <div class="vibe-sphere-wrap">
+              <video class="vibe-sphere-video" id="vibeSphereVideo" src="../assets/ym/media/vibe_animation_fallback/vibe_animation_fallback_dark.mp4" loop muted autoplay playsinline></video>
+              <div class="vibe-sphere-glow" id="ambientGlow"></div>
+              <h1 class="vibe-sphere-heading" id="vibeMainHeading">Моя волна</h1>
+            </div>
+
+            <!-- Кнопка входа, если токена нет -->
+            <button id="loginBtn" class="ym-yellow-pill-btn hidden">Войти в Яндекс Музыку</button>
+
+            <!-- Центральный плеер Моей Волны (как на скрине 1) -->
+            <div class="vibe-center-player" id="vibeCenterPlayer">
+              <img id="vibeSmallCover" src="../assets/ym/media/vibeCover.c55d574d.png" class="vibe-Floating-cover" alt="">
+
+              <div class="vibe-pill-row">
+                <button class="vibe-circle-btn" id="vibeMuteBtn" title="Звук">
+                  <svg width="18" height="18"><use href="#volume_xs"></use></svg>
+                </button>
+                <button class="vibe-circle-btn" id="vibeDislikeBtn" title="Дизлайк">
+                  <svg width="18" height="18"><use href="#dislike_xs"></use></svg>
+                </button>
+
+                <!-- Серая капсула с ползунком прогресса внутри -->
+                <div class="vibe-track-pill" id="vibeTrackPill">
+                  <div class="vibe-pill-progress" id="vibePillFill"></div>
+                  <input type="range" id="vibeSeekInput" class="vibe-pill-seek" value="0" min="0" max="100" step="0.1">
+                  <div class="vibe-pill-text">
+                    <span id="vibePillArtist">Phantaszz</span>
+                    <span class="vibe-pill-dash"> — </span>
+                    <span id="vibePillTitle">PARADISE</span>
+                  </div>
+                  <span class="vibe-explicit-badge">E</span>
+                </div>
+
+                <button class="vibe-circle-btn" id="vibeLikeBtn" title="Мне нравится">
+                  <svg width="18" height="18"><use id="vibeLikeUse" href="#like_xs"></use></svg>
+                </button>
+                <button class="vibe-circle-btn" title="Ещё">
+                  <svg width="18" height="18"><use href="#more_xs"></use></svg>
+                </button>
+              </div>
+
+              <!-- Нижние кнопки Prev / Желтый Play / Next -->
+              <div class="vibe-transport-row">
+                <button class="vibe-skip-btn" id="vibePrevBtn" title="Предыдущий">
+                  <svg width="20" height="20"><use href="#previous_xs"></use></svg>
+                </button>
+                <button class="vibe-yellow-play" id="vibePlayBtn" title="Пуск / Пауза">
+                  <svg width="24" height="24"><use id="vibePlayUse" href="#play_filled_m"></use></svg>
+                </button>
+                <button class="vibe-skip-btn" id="vibeNextBtn" title="Следующий">
+                  <svg width="20" height="20"><use href="#next_xs"></use></svg>
+                </button>
+              </div>
+
+              <!-- AI подпись снизу -->
+              <div class="vibe-ai-caption">
+                <span class="vibe-ai-badge">✦<sup>AI</sup></span>
+                <span id="vibeAiText">Фонк — не просто музыка, а целая маленькая вселенная</span>
+              </div>
+            </div>
+
+            <div class="ym-version-badge">5.126.1</div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 2: ДЛЯ ВАС И ТРЕНДЫ (СКРИН 3) ================= -->
+      <section class="ym-page" id="page-trends">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Для вас и Тренды</h1>
+
+          <div class="trends-top-pills">
+            <div class="trends-user-pill">
+              <img src="../assets/ym/media/avatar.e9a40453.png" alt="">
+              <div>
+                <div class="t-pill-title">Для вас</div>
+                <div class="t-pill-sub">kostromin, SQWOZ BAB</div>
+              </div>
+            </div>
+            <div class="trends-user-pill">
+              <img src="../assets/ym/media/artist.d238337d.webp" alt="">
+              <div>
+                <div class="t-pill-title">Тренды</div>
+                <div class="t-pill-sub">Baby Cute, Криминальный...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="trends-two-boxes">
+            <div class="trends-wide-box" data-nav="collection">
+              <img src="../assets/ym/media/heart.602389ae.png" class="twb-icon" alt="">
+              <div class="twb-meta">
+                <div class="twb-title">Мне нравится ›</div>
+                <div class="twb-sub">405 треков</div>
+              </div>
+            </div>
+            <div class="trends-wide-box">
+              <div class="twb-history-ico"><svg width="24" height="24"><use href="#history_m"></use></svg></div>
+              <div class="twb-meta">
+                <div class="twb-title">История ›</div>
+                <div class="twb-sub">LXST CXNTURY, SAKUREYE, XXXTentacion</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="trends-promo-banner">
+            <div class="tpb-left">
+              <h2>Угадаете артиста года?</h2>
+              <p>Выиграйте приз за прогноз на Распаковку</p>
+              <button class="ym-yellow-pill-btn small" data-nav="vibe">Поехали</button>
+            </div>
+            <div class="tpb-right"></div>
+          </div>
+
+          <h2 class="ym-section-h2">Свели в AI-сет</h2>
+          <div class="trends-filter-chips">
+            <span class="chip active">топ</span>
+            <span class="chip">по жанру</span>
+            <span class="chip">под настроение</span>
+            <span class="chip">под занятие</span>
+          </div>
+
+          <div class="ai-sets-grid" id="aiSetsGrid">
+            <div class="ai-set-card" data-vibe="Бег"><div class="ai-glyph blue">🏃</div><div class="ai-title">Бег</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Витч-хаус"><div class="ai-glyph indigo">7</div><div class="ai-title">Витч-хаус</div><div class="ai-sub">сет по жанру</div></div>
+            <div class="ai-set-card" data-vibe="В дороге"><div class="ai-glyph green">4</div><div class="ai-title">В дороге</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Танцевальная"><div class="ai-glyph orange">K</div><div class="ai-title">Танцевальная музыка</div><div class="ai-sub">сет по жанру</div></div>
+            <div class="ai-set-card" data-vibe="Просыпаюсь"><div class="ai-glyph amber">☀</div><div class="ai-title">Просыпаюсь</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Энергичное"><div class="ai-glyph cyan">⚡</div><div class="ai-title">Энергичное</div><div class="ai-sub">сет под настроение</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 3: КОЛЛЕКЦИЯ (СКРИН 2 и 5) ================= -->
+      <section class="ym-page" id="page-collection">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Коллекция</h1>
+          <p class="ym-page-sub">У вашей музыки есть <span style="color:#d66eff">цвет</span></p>
+
+          <div class="coll-hero">
+            <img src="../assets/ym/media/heart.602389ae.png" class="coll-big-heart" alt="">
+            <div class="coll-hero-info">
+              <h2>Моя волна по коллекции</h2>
+              <button class="ym-yellow-pill-btn small" id="playCollectionWaveBtn">► Слушать</button>
+            </div>
+          </div>
+
+          <div class="coll-liked-header">
+            <img src="../assets/ym/media/heart.602389ae.png" class="coll-mini-heart" alt="">
+            <div>
+              <div class="coll-lh-title">Мне нравится ›</div>
+              <div class="coll-lh-sub">405 треков</div>
+            </div>
+          </div>
+
+          <!-- 2-колоночный список треков как на скрине 2 -->
+          <div class="coll-tracks-grid" id="collectionTracksGrid"></div>
+
+          <h2 class="ym-section-h2" style="margin-top:32px">Любимые исполнители ›</h2>
+          <div class="coll-artists-row">
+            <div class="coll-artist-circle" data-vibe="Lil Peep">
+              <div class="ava-ring red"><img src="../assets/ym/media/artist.d238337d.webp" alt=""></div>
+              <span>Lil Peep</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Ghostemane">
+              <div class="ava-ring green"><img src="../assets/ym/media/vibeCover.c55d574d.png" alt=""></div>
+              <span>Ghostemane</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Type O Negative">
+              <div class="ava-ring dark"><span>TYPE O NEGATIVE</span></div>
+              <span>Type O Negative</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="XXXTentacion">
+              <div class="ava-ring bw"><img src="../assets/ym/media/avatar.e9a40453.png" alt=""></div>
+              <span>XXXTentacion</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Phantaszz">
+              <div class="ava-ring gray"><img src="../assets/ym/media/artist.d238337d.webp" alt=""></div>
+              <span>Phantaszz</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 4: КОНЦЕРТЫ (СКРИН 4) ================= -->
+      <section class="ym-page" id="page-concerts">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Концерты</h1>
+          <p class="ym-page-sub">Рядом ⌄</p>
+          <h2 class="ym-section-h2">Топ для вас</h2>
+
+          <div class="concerts-grid">
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/artist.d238337d.webp')">
+                <div class="concert-date-badge"><span>ДЕК</span><strong>24</strong><span>ЧТ</span></div>
+              </div>
+              <div class="concert-title">F0lk</div>
+              <div class="concert-place">Концерт • 16+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 2 000 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/vibeCover.c55d574d.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>20</strong><span>ПТ</span></div>
+              </div>
+              <div class="concert-title">Toxi$</div>
+              <div class="concert-place">Концерт • 18+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 3 900 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/heart.602389ae.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>21</strong><span>СБ</span></div>
+              </div>
+              <div class="concert-title">Премия Яндекс Музыки: Распаковка 2026</div>
+              <div class="concert-place">Концерт • 16+ • Москва</div>
+              <button class="ym-yellow-pill-btn tiny">от 5 500 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/avatar.e9a40453.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>15</strong><span>ВС</span></div>
+              </div>
+              <div class="concert-title">H8.Hood</div>
+              <div class="concert-place">Концерт • 16+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 1 700 ₽</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 5: КНИГИ И ПОДКАСТЫ (СКРИН 5) ================= -->
+      <section class="ym-page" id="page-podcasts">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Книги и подкасты</h1>
+          <h2 class="ym-section-h2">Продолжить слушать</h2>
+          <div class="podcasts-top-row">
+            <div class="pod-pill gray">
+              <div class="pod-title">Денис Шабалов. «Метро...» ›</div>
+              <div class="pod-sub">● 21 секунда</div>
+            </div>
+            <div class="pod-pill purple">
+              <div class="pod-title">Моя полка ›</div>
+            </div>
+            <div class="pod-pill magenta">
+              <div class="pod-title">Новые выпуски ›</div>
+            </div>
+          </div>
+
+          <h2 class="ym-section-h2" style="margin-top:28px">Актуальное</h2>
+          <div class="pod-banners-grid">
+            <div class="pod-banner c1"><div class="pb-label">Сага о Школе Вождей</div></div>
+            <div class="pod-banner c2"><div class="pb-label">Спрячь мои тайны в саду</div></div>
+            <div class="pod-banner c3"><div class="pb-label">Лев в долине</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 6: ПОИСК ================= -->
+      <section class="ym-page" id="page-search">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Поиск</h1>
+          <div class="ym-search-bar">
+            <svg width="20" height="20"><use href="#search_xs"></use></svg>
+            <input type="text" id="searchInput" placeholder="Трек, альбом, исполнитель или подкаст">
+          </div>
+          <h2 class="ym-section-h2">Треки из вашей очереди</h2>
+          <div class="coll-tracks-grid" id="searchTracksGrid"></div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 7: НАСТРОЙКИ (СКРИН 7 + СТУДИЯ ОБОЕВ) ================= -->
+      <section class="ym-page" id="page-settings">
+        <div class="ym-page-scroll">
+          <div class="settings-top-bar">
+            <button class="settings-back-btn" data-nav="vibe">‹</button>
+            <h1 class="ym-page-title" style="margin:0">Настройки</h1>
+          </div>
+
+          <!-- БЛОК ЖИВЫХ ОБОЕВ NEBULA (РАБОТАЕТ СРАЗУ) -->
+          <div class="nebula-wallpaper-studio">
+            <div class="nws-header">
+              <div>
+                <div class="nws-title">Живые обои и прозрачность (Nebula Studio)</div>
+                <div class="nws-sub">Поддерживаются любые .mp4, .webm, .gif, .jpg, .png (можно просто перетащить файл в окно)</div>
+              </div>
+              <button class="ym-yellow-pill-btn small" id="settingsChooseWallpaperBtn">Выбрать файл с ПК</button>
+            </div>
+
+            <div class="nws-presets">
+              <button class="nws-preset-btn active" data-preset="default-vibe">Сфера Волны (Видео)</button>
+              <button class="nws-preset-btn" data-preset="splash-dark">Неоновый поток (Видео)</button>
+              <button class="nws-preset-btn" data-preset="constellations">Только созвездия</button>
+            </div>
+
+            <div class="nws-sliders">
+              <div class="nws-slider-row">
+                <span>Прозрачность панелей интерфейса</span>
+                <input type="range" id="opacitySlider" class="ym-slider" min="10" max="100" value="58">
+              </div>
+              <div class="nws-slider-row">
+                <span>Яркость фоновых обоев</span>
+                <input type="range" id="brightnessSlider" class="ym-slider" min="15" max="100" value="65">
+              </div>
+            </div>
+          </div>
+
+          <!-- Оригинальные пункты настроек со скрина 7 -->
+          <div class="ym-settings-list">
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Офлайн-режим</div>
+                <div class="ym-set-sub">Слушайте скачанное без интернета</div>
+              </div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Очистить память</div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Эквалайзер</div>
+                <div class="ym-set-sub">Включен</div>
+              </div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Плавные переходы между треками</div>
+              <input type="checkbox" class="ym-switch" checked>
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Меньше ИИ</div>
+                <div class="ym-set-sub">В рекомендациях будет реже встречаться музыка, созданная с помощью ИИ</div>
+              </div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Уточнить предпочтения</div>
+                <div class="ym-set-sub">Если ваши музыкальные предпочтения поменялись, уточните это здесь</div>
+              </div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Показывать раздел «Детям»</div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Горячие клавиши</div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+          </div>
+
+          <h3 class="ym-set-section-title">Вид плеера</h3>
+          <div class="ym-player-skins">
+            <div class="ym-skin-card active" data-skin="default">
+              <div class="skin-preview"><div class="skin-line"><span class="skin-dot"></span></div></div>
+              <span>Стандартный</span>
+            </div>
+            <div class="ym-skin-card" data-skin="duck">
+              <div class="skin-preview emoji">🦆</div>
+              <span>Уточка</span>
+            </div>
+            <div class="ym-skin-card" data-skin="car">
+              <div class="skin-preview emoji">🏎️</div>
+              <span>Машинка</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================= НИЖНИЙ ВСПЛЫВАЮЩИЙ ПЛЕЕР-БАР (СКРИНЫ 2-7) ================= -->
+      <footer class="ym-bottom-player hidden" id="bottomPlayerBar">
+        <div class="ym-bp-progress-bg" id="bpProgressBg"></div>
+        <input type="range" id="seekBar" class="ym-bp-seek" value="0" min="0" max="100" step="0.1">
+
+        <div class="ym-bp-left">
+          <img id="coverImg" src="../assets/ym/media/vibeCover.c55d574d.png" class="ym-bp-cover" alt="">
+          <div class="ym-bp-meta">
+            <div class="ym-bp-title-row">
+              <span id="trackTitle" class="ym-bp-title">PARADISE</span>
+              <span class="vibe-explicit-badge">E</span>
+            </div>
+            <div id="trackArtist" class="ym-bp-artist">Phantaszz</div>
+          </div>
+        </div>
+
+        <div class="ym-bp-center">
+          <button class="ym-bp-btn" id="bpDislikeBtn" title="Дизлайк">
+            <svg width="20" height="20"><use href="#dislike_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn muted" title="Вперемешку">
+            <svg width="20" height="20"><use href="#shuffle_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="prevBtn" title="Предыдущий">
+            <svg width="22" height="22"><use href="#previous_xs"></use></svg>
+          </button>
+          <button class="ym-bp-play" id="playBtn" title="Воспроизведение / Пауза">
+            <svg width="22" height="22"><use id="playIconUse" href="#play_filled_m"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="nextBtn" title="Следующий">
+            <svg width="22" height="22"><use href="#next_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn muted" title="Повтор">
+            <svg width="20" height="20"><use href="#repeat_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="likeBtn" title="Мне нравится">
+            <svg width="20" height="20"><use id="likeIconUse" href="#like_xs"></use></svg>
+          </button>
+        </div>
+
+        <div class="ym-bp-right">
+          <span class="ym-bp-time"><span id="curTime">0:00</span> / <span id="durTime">0:00</span></span>
+          <button class="ym-bp-btn muted" title="Текст песни">
+            <svg width="20" height="20"><use href="#syncLyrics_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" data-nav="collection" title="Очередь">
+            <svg width="20" height="20"><use href="#playQueue_xs"></use></svg>
+          </button>
+          <div class="ym-bp-vol">
+            <svg width="20" height="20"><use href="#volume_xs"></use></svg>
+            <input type="range" id="volBar" class="ym-slider vol" value="60" min="0" max="100">
+          </div>
+        </div>
+      </footer>
+
+    </main>
+  </div>
+
+  <script src="../player/audioCore.js"></script>
+  <script src="visualEngine.js"></script>
+  <script src="uiControls.js"></script>
+</body>
+</html>
+
+=== FILE: src\ui\uiControls.js ===
+// 1. Инжектим оригинальный sprite.svg для мгновенной работы всех иконок Яндекса
+fetch('../assets/ym/icons/sprite.svg')
+  .then(r => r.text())
+  .then(svg => { document.getElementById('svgSpriteContainer').innerHTML = svg; })
+  .catch(err => console.error('Sprite error:', err));
+
+// 2. Кнопки окна
+document.getElementById('minBtn').addEventListener('click', () => window.nebulaAPI.minimize());
+document.getElementById('maxBtn').addEventListener('click', () => window.nebulaAPI.maximize());
+document.getElementById('closeBtn').addEventListener('click', () => window.nebulaAPI.close());
+
+// 3. НАВИГАЦИЯ ПО ВКЛАДКАМ (Моя волна / Тренды / Концерты / Книги / Коллекция / Настройки)
+const navButtons = document.querySelectorAll('[data-nav]');
+const pages = document.querySelectorAll('.ym-page');
+const bottomPlayerBar = document.getElementById('bottomPlayerBar');
+const profilePopup = document.getElementById('profilePopup');
+
+function switchPage(pageId) {
+  pages.forEach(p => p.classList.toggle('active', p.id === `page-${pageId}`));
+  document.querySelectorAll('.ym-nav-btn').forEach(btn => {
+    btn.classList.toggle('active', btn.dataset.nav === pageId);
+  });
+  // На экране «Моя волна» плеер в центре под сферой, а на остальных вкладках всплывает нижний бар (как в 5.126.1)
+  if (pageId === 'vibe') {
+    bottomPlayerBar.classList.add('hidden');
+  } else {
+    bottomPlayerBar.classList.remove('hidden');
+  }
+  profilePopup.classList.add('hidden');
+}
+
+navButtons.forEach(btn => {
+  btn.addEventListener('click', () => switchPage(btn.dataset.nav));
+});
+
+// Профиль попап
+document.getElementById('profileBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  profilePopup.classList.toggle('hidden');
+});
+document.getElementById('closePopupBtn').addEventListener('click', () => profilePopup.classList.add('hidden'));
+
+// 4. ЖИВЫЕ ОБОИ (РАБОТАЮТ СРАЗУ: ВИДЕО, ФОТО, GIF, DRAG & DROP)
+const bgVideo = document.getElementById('bgVideo');
+const bgImage = document.getElementById('bgImage');
+const wallpaperInput = document.getElementById('wallpaperInput');
+const opacitySlider = document.getElementById('opacitySlider');
+const brightnessSlider = document.getElementById('brightnessSlider');
+
+function applyWallpaperFile(file) {
+  if (!file) return;
+  const url = URL.createObjectURL(file);
+
+  if (file.type.startsWith('video/')) {
+    bgImage.classList.add('hidden');
+    bgVideo.classList.remove('hidden');
+    bgVideo.src = url;
+    bgVideo.play();
+  } else if (file.type.startsWith('image/')) {
+    bgVideo.classList.add('hidden');
+    bgImage.classList.remove('hidden');
+    bgImage.style.backgroundImage = `url("${url}")`;
+  }
+
+  // Если прозрачность была выкручена в 100%, автоматически делаем панели стеклянными, чтобы обои было видно сразу
+  if (Number(opacitySlider.value) > 75) {
+    opacitySlider.value = 55;
+    document.documentElement.style.setProperty('--panel-opacity', '0.55');
+    window.nebulaAPI.setConfig({ hudOpacity: 55 });
+  }
+}
+
+document.getElementById('quickWallpaperBtn').addEventListener('click', () => wallpaperInput.click());
+document.getElementById('popupWallpaperBtn').addEventListener('click', () => {
+  profilePopup.classList.add('hidden');
+  wallpaperInput.click();
+});
+document.getElementById('settingsChooseWallpaperBtn').addEventListener('click', () => wallpaperInput.click());
+
+wallpaperInput.addEventListener('change', (e) => {
+  if (e.target.files[0]) applyWallpaperFile(e.target.files[0]);
+});
+
+// Перетаскивание любого видео или картинки прямо в окно плеера
+window.addEventListener('dragover', (e) => e.preventDefault());
+window.addEventListener('drop', (e) => {
+  e.preventDefault();
+  if (e.dataTransfer.files[0]) applyWallpaperFile(e.dataTransfer.files[0]);
+});
+
+// Пресеты обоев в настройках
+document.querySelectorAll('.nws-preset-btn').forEach(btn => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('.nws-preset-btn').forEach(b => b.classList.remove('active'));
+    btn.classList.add('active');
+    const preset = btn.dataset.preset;
+    bgImage.classList.add('hidden');
+    if (preset === 'default-vibe') {
+      bgVideo.classList.remove('hidden');
+      bgVideo.src = '../assets/ym/media/vibe_animation_fallback/vibe_animation_fallback_dark.mp4';
+      bgVideo.play();
+    } else if (preset === 'splash-dark') {
+      bgVideo.classList.remove('hidden');
+      bgVideo.src = '../assets/ym/media/splash_screen/splash_screen_dark.webm';
+      bgVideo.play();
+    } else {
+      bgVideo.classList.add('hidden');
+    }
+  });
+});
+
+opacitySlider.addEventListener('input', (e) => {
+  const val = (e.target.value / 100).toFixed(2);
+  document.documentElement.style.setProperty('--panel-opacity', val);
+  window.nebulaAPI.setConfig({ hudOpacity: Number(e.target.value) });
+});
+
+brightnessSlider.addEventListener('input', (e) => {
+  const val = (e.target.value / 100).toFixed(2);
+  document.documentElement.style.setProperty('--wallpaper-brightness', val);
+});
+
+document.getElementById('toggleGlassBtn').addEventListener('click', () => {
+  const current = Number(opacitySlider.value);
+  const next = current > 60 ? 35 : 75;
+  opacitySlider.value = next;
+  document.documentElement.style.setProperty('--panel-opacity', (next / 100).toFixed(2));
+  profilePopup.classList.add('hidden');
+});
+
+// Переключение скинов плеера (Стандартный / Уточка / Машинка)
+document.querySelectorAll('.ym-skin-card').forEach(card => {
+  card.addEventListener('click', () => {
+    document.querySelectorAll('.ym-skin-card').forEach(c => c.classList.remove('active'));
+    card.classList.add('active');
+  });
+});
+
+// 5. АУДИОДВИЖОК И МОЯ ВОЛНА
+const loginBtn = document.getElementById('loginBtn');
+const vibeCenterPlayer = document.getElementById('vibeCenterPlayer');
+const vibeSmallCover = document.getElementById('vibeSmallCover');
+const vibePillArtist = document.getElementById('vibePillArtist');
+const vibePillTitle = document.getElementById('vibePillTitle');
+const vibePillFill = document.getElementById('vibePillFill');
+const vibeSeekInput = document.getElementById('vibeSeekInput');
+const vibePlayBtn = document.getElementById('vibePlayBtn');
+const vibePlayUse = document.getElementById('vibePlayUse');
+const vibePrevBtn = document.getElementById('vibePrevBtn');
+const vibeNextBtn = document.getElementById('vibeNextBtn');
+const vibeLikeBtn = document.getElementById('vibeLikeBtn');
+const vibeLikeUse = document.getElementById('vibeLikeUse');
+const vibeMainHeading = document.getElementById('vibeMainHeading');
+
+const coverImg = document.getElementById('coverImg');
+const trackTitle = document.getElementById('trackTitle');
+const trackArtist = document.getElementById('trackArtist');
+const playBtn = document.getElementById('playBtn');
+const playIconUse = document.getElementById('playIconUse');
+const prevBtn = document.getElementById('prevBtn');
+const nextBtn = document.getElementById('nextBtn');
+const likeBtn = document.getElementById('likeBtn');
+const likeIconUse = document.getElementById('likeIconUse');
+const seekBar = document.getElementById('seekBar');
+const bpProgressBg = document.getElementById('bpProgressBg');
+const volBar = document.getElementById('volBar');
+const curTimeEl = document.getElementById('curTime');
+const durTimeEl = document.getElementById('durTime');
+
+const collectionTracksGrid = document.getElementById('collectionTracksGrid');
+const searchTracksGrid = document.getElementById('searchTracksGrid');
+
+let token = null;
+let queue = [];
+let currentIndex = 0;
+let isLiked = false;
+
+function formatTime(sec) {
+  if (!sec || isNaN(sec)) return '0:00';
+  const m = Math.floor(sec / 60);
+  const s = Math.floor(sec % 60).toString().padStart(2, '0');
+  return `${m}:${s}`;
+}
+
+function syncPlayIcons(isPlaying) {
+  const icon = isPlaying ? '#pause_filled_m' : '#play_filled_m';
+  playIconUse.setAttribute('href', icon);
+  vibePlayUse.setAttribute('href', icon);
+}
+
+function renderTrackLists() {
+  const html = queue.map((t, idx) => `
+    <div class="coll-track-row" data-idx="${idx}">
+      <img src="${t.cover || '../assets/ym/media/vibeCover.c55d574d.png'}" alt="">
+      <div class="ctr-meta">
+        <div class="ctr-title" style="${idx === currentIndex ? 'color:var(--ym-yellow)' : ''}">${t.title}</div>
+        <div class="ctr-artist">${t.artist}</div>
+      </div>
+      <div class="ctr-dur">${formatTime(t.duration)}</div>
+    </div>
+  `).join('');
+
+  collectionTracksGrid.innerHTML = html;
+  searchTracksGrid.innerHTML = html;
+
+  document.querySelectorAll('.coll-track-row').forEach(row => {
+    row.addEventListener('click', () => {
+      currentIndex = Number(row.dataset.idx);
+      loadAndPlay(currentIndex);
+    });
+  });
+}
+
+async function startWave() {
+  loginBtn.classList.add('hidden');
+  vibeCenterPlayer.classList.remove('hidden');
+  try {
+    queue = await window.nebulaAPI.getWave(token);
+    currentIndex = 0;
+    renderTrackLists();
+    await loadAndPlay(currentIndex);
+  } catch (err) {
+    console.error('Ошибка волны:', err);
+  }
+}
+
+async function loadAndPlay(index) {
+  if (!queue.length) return;
+  const track = queue[index];
+
+  trackTitle.textContent = track.title;
+  trackArtist.textContent = track.artist;
+  vibePillTitle.textContent = track.title;
+  vibePillArtist.textContent = track.artist;
+
+  const cover = track.cover || '../assets/ym/media/vibeCover.c55d574d.png';
+  coverImg.src = cover;
+  vibeSmallCover.src = cover;
+
+  renderTrackLists();
+
+  try {
+    const streamUrl = await window.nebulaAPI.getTrackUrl(token, track.id);
+    if (window.visualEngine) window.visualEngine.connectAudio(window.audioCore.audio);
+    await window.audioCore.playUrl(streamUrl);
+    syncPlayIcons(true);
+  } catch (err) {
+    console.error('Ошибка потока:', err);
+  }
+}
+
+function togglePlay() {
+  const isPlaying = window.audioCore.toggle();
+  syncPlayIcons(isPlaying);
+}
+
+playBtn.addEventListener('click', togglePlay);
+vibePlayBtn.addEventListener('click', togglePlay);
+
+async function playNext() {
+  currentIndex++;
+  if (currentIndex >= queue.length) {
+    queue = await window.nebulaAPI.getWave(token);
+    currentIndex = 0;
+  }
+  loadAndPlay(currentIndex);
+}
+
+function playPrev() {
+  if (currentIndex > 0) {
+    currentIndex--;
+    loadAndPlay(currentIndex);
+  }
+}
+
+nextBtn.addEventListener('click', playNext);
+vibeNextBtn.addEventListener('click', playNext);
+prevBtn.addEventListener('click', playPrev);
+vibePrevBtn.addEventListener('click', playPrev);
+
+// Клик по быстрым тегам волны слева и настройкам настроения
+document.querySelectorAll('[data-vibe], [data-vibe-mood]').forEach(el => {
+  el.addEventListener('click', () => {
+    const label = el.dataset.vibe || el.dataset.vibeMood;
+    vibeMainHeading.textContent = label || 'Моя волна';
+    switchPage('vibe');
+    playNext();
+  });
+});
+
+document.getElementById('reshuffleWaveBtn').addEventListener('click', () => startWave());
+document.getElementById('playCollectionWaveBtn').addEventListener('click', () => {
+  switchPage('vibe');
+  togglePlay();
+});
+
+function toggleLike() {
+  isLiked = !isLiked;
+  likeBtn.classList.toggle('liked', isLiked);
+  vibeLikeBtn.classList.toggle('liked', isLiked);
+  const href = isLiked ? '#liked_xs' : '#like_xs';
+  likeIconUse.setAttribute('href', href);
+  vibeLikeUse.setAttribute('href', href);
+}
+
+likeBtn.addEventListener('click', toggleLike);
+vibeLikeBtn.addEventListener('click', toggleLike);
+
+// Перемотка и громкость
+function handleSeek(val) {
+  window.audioCore.seek(val);
+  vibePillFill.style.width = `${val}%`;
+  bpProgressBg.style.width = `${val}%`;
+}
+
+seekBar.addEventListener('input', (e) => handleSeek(e.target.value));
+vibeSeekInput.addEventListener('input', (e) => handleSeek(e.target.value));
+
+volBar.addEventListener('input', (e) => {
+  window.audioCore.setVolume(e.target.value / 100);
+  window.nebulaAPI.setConfig({ volume: Number(e.target.value) });
+});
+
+window.audioCore.onTimeUpdate((progress, current, duration) => {
+  seekBar.value = progress;
+  vibeSeekInput.value = progress;
+  vibePillFill.style.width = `${progress}%`;
+  bpProgressBg.style.width = `${progress}%`;
+  curTimeEl.textContent = formatTime(current);
+  durTimeEl.textContent = formatTime(duration);
+});
+
+window.audioCore.onEnded(() => playNext());
+
+// Авторизация
+async function triggerLogin() {
+  const newToken = await window.nebulaAPI.login();
+  if (newToken) {
+    token = newToken;
+    startWave();
+  }
+}
+
+loginBtn.addEventListener('click', triggerLogin);
+document.getElementById('reloginBtn').addEventListener('click', triggerLogin);
+
+// Старт и чтение конфига
+(async function init() {
+  const cfg = await window.nebulaAPI.getConfig();
+  if (cfg.volume !== undefined) {
+    volBar.value = cfg.volume;
+    window.audioCore.setVolume(cfg.volume / 100);
+  }
+  if (cfg.hudOpacity !== undefined) {
+    opacitySlider.value = cfg.hudOpacity;
+    document.documentElement.style.setProperty('--panel-opacity', (cfg.hudOpacity / 100).toFixed(2));
+  }
+  if (cfg.ym_token) {
+    token = cfg.ym_token;
+    startWave();
+  } else {
+    loginBtn.classList.remove('hidden');
+    vibeCenterPlayer.classList.add('hidden');
+  }
+})();
+
+=== FILE: src\ui\visualEngine.js ===
+class VisualEngine {
+  constructor() {
+    this.canvas = document.getElementById('bgCanvas');
+    this.ctx = this.canvas.getContext('2d');
+    this.video = document.getElementById('bgVideo');
+    this.particles = [];
+    this.mouse = { x: -1000, y: -1000 };
+    this.analyser = null;
+    this.dataArray = null;
+    this.audioReactive = true;
+    this.visScale = 1.0;
+
+    this.resize();
+    window.addEventListener('resize', () => this.resize());
+    window.addEventListener('mousemove', (e) => {
+      this.mouse.x = e.clientX;
+      this.mouse.y = e.clientY;
+    });
+
+    this.initParticles(75);
+    this.animate();
+  }
+
+  resize() {
+    this.canvas.width = window.innerWidth;
+    this.canvas.height = window.innerHeight;
+  }
+
+  initParticles(count) {
+    this.particles = [];
+    for (let i = 0; i < count; i++) {
+      this.particles.push({
+        x: Math.random() * this.canvas.width,
+        y: Math.random() * this.canvas.height,
+        vx: (Math.random() - 0.5) * 0.4,
+        vy: (Math.random() - 0.5) * 0.4,
+        r: Math.random() * 2 + 1
+      });
+    }
+  }
+
+  connectAudio(audioElement) {
+    if (this.analyser) return;
+    try {
+      const ctx = new (window.AudioContext || window.webkitAudioContext)();
+      const src = ctx.createMediaElementSource(audioElement);
+      this.analyser = ctx.createAnalyser();
+      this.analyser.fftSize = 128;
+      src.connect(this.analyser);
+      this.analyser.connect(ctx.destination);
+      this.dataArray = new Uint8Array(this.analyser.frequencyBinCount);
+    } catch (e) {
+      console.warn('Web Audio API init skipped:', e);
+    }
+  }
+
+  setVideoWallpaper(file) {
+    const url = URL.createObjectURL(file);
+    this.video.src = url;
+    this.video.classList.remove('hidden');
+    this.video.play();
+  }
+
+  getBassEnergy() {
+    if (!this.analyser || !this.audioReactive) return 0;
+    this.analyser.getByteFrequencyData(this.dataArray);
+    let sum = 0;
+    for (let i = 0; i < 8; i++) sum += this.dataArray[i];
+    return (sum / (8 * 255)); // от 0.0 до 1.0
+  }
+
+  animate() {
+    requestAnimationFrame(() => this.animate());
+    const { ctx, canvas } = this;
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+    const bass = this.getBassEnergy();
+
+    // Передаем пульсацию баса на обложку
+    const cover = document.getElementById('coverImg');
+    if (cover) {
+      const scale = 1 + bass * 0.08 * this.visScale;
+      cover.style.transform = `scale(${scale.toFixed(3)})`;
+    }
+
+    // Рисуем созвездия
+    for (let i = 0; i < this.particles.length; i++) {
+      const p = this.particles[i];
+      p.x += p.vx * (1 + bass * 2);
+      p.y += p.vy * (1 + bass * 2);
+
+      if (p.x < 0 || p.x > canvas.width) p.vx *= -1;
+      if (p.y < 0 || p.y > canvas.height) p.vy *= -1;
+
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r + bass * 2, 0, Math.PI * 2);
+      ctx.fillStyle = `rgba(180, 130, 255, ${0.4 + bass * 0.5})`;
+      ctx.fill();
+
+      for (let j = i + 1; j < this.particles.length; j++) {
+        const p2 = this.particles[j];
+        const dist = Math.hypot(p.x - p2.x, p.y - p2.y);
+        if (dist < 130) {
+          ctx.beginPath();
+          ctx.moveTo(p.x, p.y);
+          ctx.lineTo(p2.x, p2.y);
+          ctx.strokeStyle = `rgba(138, 43, 226, ${(1 - dist / 130) * 0.25})`;
+          ctx.stroke();
+        }
+      }
+
+      const mDist = Math.hypot(p.x - this.mouse.x, p.y - this.mouse.y);
+      if (mDist < 160) {
+        ctx.beginPath();
+        ctx.moveTo(p.x, p.y);
+        ctx.lineTo(this.mouse.x, this.mouse.y);
+        ctx.strokeStyle = `rgba(0, 210, 255, ${(1 - mDist / 160) * 0.4})`;
+        ctx.stroke();
+      }
+    }
+
+    // Нижний спектральный эквалайзер
+    if (this.analyser) {
+      const bars = 40;
+      const barWidth = (canvas.width * 0.5 * this.visScale) / bars;
+      const startX = (canvas.width - bars * barWidth) / 2;
+
+      for (let i = 0; i < bars; i++) {
+        const val = this.audioReactive
+          ? this.dataArray[i] / 255
+          : (Math.sin(Date.now() * 0.003 + i * 0.3) + 1) * 0.15;
+
+        const barHeight = val * 90 * this.visScale;
+        const x = startX + i * barWidth;
+        const y = canvas.height - 115 - barHeight;
+
+        const grad = ctx.createLinearGradient(x, y, x, canvas.height - 115);
+        grad.addColorStop(0, 'rgba(0, 225, 255, 0.75)');
+        grad.addColorStop(1, 'rgba(138, 43, 226, 0.05)');
+
+        ctx.fillStyle = grad;
+        ctx.beginPath();
+        ctx.roundRect(x + 2, y, Math.max(2, barWidth - 4), barHeight, 4);
+        ctx.fill();
+      }
+    }
+  }
+}
+
+window.visualEngine = new VisualEngine();
+

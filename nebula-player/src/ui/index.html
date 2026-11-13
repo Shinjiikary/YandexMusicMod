@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="ru" class="ym-dark-theme">
+<head>
+  <meta charset="UTF-8">
+  <title>Яндекс Музыка</title>
+  <link rel="stylesheet" href="../assets/ym/ym-bundle.css">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <!-- Инжект оригинального sprite.svg -->
+  <div id="svgSpriteContainer" style="display: none;"></div>
+
+  <!-- СЛОИ ЖИВЫХ ОБОЕВ (РАБОТАЮТ СРАЗУ) -->
+  <div id="bgImage" class="bg-layer bg-image hidden"></div>
+  <video id="bgVideo" class="bg-layer bg-video" src="../assets/ym/media/vibe_animation_fallback/vibe_animation_fallback_dark.mp4" loop muted autoplay playsinline></video>
+  <canvas id="bgCanvas" class="bg-layer bg-canvas"></canvas>
+  <div id="bgDimmer" class="bg-layer bg-dimmer"></div>
+
+  <!-- Скрытый инпут для мгновенной загрузки любых видео и фото обоев -->
+  <input type="file" id="wallpaperInput" accept="video/mp4,video/webm,image/jpeg,image/png,image/webp,image/gif" class="hidden">
+
+  <!-- Верхний системный TitleBar -->
+  <header class="ym-titlebar">
+    <div class="ym-titlebar-drag"></div>
+    <div class="ym-window-controls">
+      <button class="ym-win-btn" id="minBtn" title="Свернуть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect y="4.5" width="10" height="1" fill="currentColor"/></svg>
+      </button>
+      <button class="ym-win-btn" id="maxBtn" title="Развернуть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><rect x="1" y="1" width="8" height="8" stroke="currentColor" stroke-width="1" fill="none"/></svg>
+      </button>
+      <button class="ym-win-btn close" id="closeBtn" title="Закрыть">
+        <svg width="10" height="10" viewBox="0 0 10 10"><path d="M1.5 1.5L8.5 8.5M8.5 1.5L1.5 8.5" stroke="currentColor" stroke-width="1.2"/></svg>
+      </button>
+    </div>
+  </header>
+
+  <!-- ГЛАВНЫЙ КАРКАС 5.126.1 -->
+  <div class="ym-app-shell" id="appShell">
+
+    <!-- ЛЕВЫЙ САЙДБАР -->
+    <aside class="ym-sidebar">
+      <div class="ym-sidebar-header">
+        <div class="ym-brand-logo" data-nav="vibe">
+          <svg width="136" height="28" class="ym-logo-icon"><use href="#musicLogoLeftRu"></use></svg>
+        </div>
+        <button class="ym-collapse-btn" title="Свернуть меню">
+          <svg width="14" height="14"><use href="#arrowLeft_xxs"></use></svg>
+        </button>
+      </div>
+
+      <nav class="ym-nav">
+        <button class="ym-nav-btn" data-nav="search">
+          <svg class="ym-nav-ico"><use href="#navigationSearch_xs"></use></svg>
+          <span>Поиск</span>
+        </button>
+        <button class="ym-nav-btn active" data-nav="vibe">
+          <svg class="ym-nav-ico"><use href="#navigationMyVibe_xs"></use></svg>
+          <span>Моя волна</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="trends">
+          <svg class="ym-nav-ico"><use href="#navigationForYouAndTrends_xs"></use></svg>
+          <span>Для вас и Тренды</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="concerts">
+          <svg class="ym-nav-ico"><use href="#navigationConcerts_xs"></use></svg>
+          <span>Концерты</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="podcasts">
+          <svg class="ym-nav-ico"><use href="#navigationNonMusic_xs"></use></svg>
+          <span>Книги и подкасты</span>
+        </button>
+        <button class="ym-nav-btn" data-nav="collection">
+          <svg class="ym-nav-ico"><use href="#navigationCollection_xs"></use></svg>
+          <span>Коллекция</span>
+        </button>
+      </nav>
+
+      <!-- Закрепленные волны как в оригинале -->
+      <div class="ym-pins">
+        <div class="ym-pin-row" data-vibe-mood="Весёлое">
+          <div class="ym-pin-badge pink">
+            <svg width="16" height="16"><use href="#note_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Весёлое</div>
+            <div class="ym-pin-type">Моя волна</div>
+          </div>
+        </div>
+        <div class="ym-pin-row" data-vibe-mood="Грустное">
+          <div class="ym-pin-badge pink">
+            <svg width="16" height="16"><use href="#note_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Грустное</div>
+            <div class="ym-pin-type">Моя волна</div>
+          </div>
+        </div>
+
+        <!-- Быстрая кнопка смены обоев прямо в сайдбаре -->
+        <div class="ym-pin-row" id="quickWallpaperBtn" title="Загрузить видео (.mp4/.webm) или фото">
+          <div class="ym-pin-badge neon">
+            <svg width="16" height="16"><use href="#picture_xs"></use></svg>
+          </div>
+          <div class="ym-pin-text">
+            <div class="ym-pin-name">Сменить обои</div>
+            <div class="ym-pin-type">Видео / Фото / GIF</div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Профиль снизу слева (Антон Радаев + Плюс) -->
+      <div class="ym-profile-bar" id="profileBtn">
+        <img src="../assets/ym/media/avatar.e9a40453.png" class="ym-profile-ava" alt="">
+        <div class="ym-profile-meta">
+          <div class="ym-profile-name">Антон Радаев</div>
+          <div class="ym-plus-pill">
+            <svg width="12" height="12"><use href="#plus"></use></svg>
+            <span>Плюс</span>
+          </div>
+        </div>
+      </div>
+    </aside>
+
+    <!-- ВСПЛЫВАЮЩЕЕ МЕНЮ ПРОФИЛЯ (со скрина 6) -->
+    <div class="ym-profile-popup hidden" id="profilePopup">
+      <div class="ym-popup-top">
+        <div class="ym-ya-id">Я ID</div>
+        <button class="ym-popup-close" id="closePopupBtn">✕</button>
+      </div>
+      <div class="ym-popup-auth-box" id="popupAuthBox">
+        <div class="ym-popup-auth-title">Аккаунт подключен</div>
+        <div class="ym-popup-auth-sub">Антон Радаев • Подписка Плюс активна</div>
+        <button class="ym-popup-white-btn" id="reloginBtn">Сменить аккаунт</button>
+      </div>
+      <div class="ym-popup-links">
+        <button class="ym-popup-item" id="popupWallpaperBtn">
+          <svg width="18" height="18"><use href="#picture_xs"></use></svg>
+          <span>Выбрать живые обои...</span>
+        </button>
+        <button class="ym-popup-item" data-nav="settings">
+          <svg width="18" height="18"><use href="#settings_xs"></use></svg>
+          <span>Настройки</span>
+        </button>
+        <button class="ym-popup-item" id="toggleGlassBtn">
+          <svg width="18" height="18"><use href="#eye_crossed_xxs"></use></svg>
+          <span>Прозрачность интерфейса</span>
+        </button>
+      </div>
+    </div>
+
+    <!-- ПРАВАЯ ГЛАВНАЯ ОБЛАСТЬ (ВСЕ ЭКРАНЫ) -->
+    <main class="ym-stage">
+
+      <!-- ================= ЭКРАН 1: МОЯ ВОЛНА (СКРИН 1) ================= -->
+      <section class="ym-page active" id="page-vibe">
+        <div class="vibe-split-layout">
+          
+          <!-- Левая дуга/колонка быстрых вайбов -->
+          <div class="vibe-agents-list">
+            <div class="vibe-agent-item" data-vibe="Клауд-рэп в дымке">
+              <div class="vibe-agent-ico green">✖</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Клауд-рэп в дымке</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Рэпкор">
+              <div class="vibe-agent-ico blue">⚡</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Рэпкор</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Иностранный рэп и хип-хоп">
+              <div class="vibe-agent-ico teal">A</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Иностранный рэп и хип-хоп на английском</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="В стиле Ghostemane">
+              <img src="../assets/ym/media/artist.d238337d.webp" class="vibe-agent-ava" alt="">
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-sub">В стиле артиста</span>
+                <span class="vibe-agent-title">Ghostemane</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item highlight" id="reshuffleWaveBtn">
+              <div class="vibe-agent-ico yellow-wave">⇄</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title yellow-text">Встряхнуть Мою волну</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-nav="trends">
+              <div class="vibe-agent-ico raspakovka">РАСПА<br>КОВКА</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Артистом года станет... ↗</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Сон зовёт">
+              <div class="vibe-agent-ico sleep">🌙</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title">Сон зовёт</span>
+              </div>
+            </div>
+
+            <div class="vibe-agent-item" data-vibe="Моя волна на двоих">
+              <div class="vibe-agent-ico duo">🃏</div>
+              <div class="vibe-agent-text">
+                <span class="vibe-agent-title muted">Моя волна на двоих</span>
+              </div>
+            </div>
+          </div>
+
+          <!-- Правая часть: Огромная сфера Моей Волны + капсула трека + жёлтый Play -->
+          <div class="vibe-sphere-stage">
+            <div class="vibe-sphere-wrap">
+              <video class="vibe-sphere-video" id="vibeSphereVideo" src="../assets/ym/media/vibe_animation_fallback/vibe_animation_fallback_dark.mp4" loop muted autoplay playsinline></video>
+              <div class="vibe-sphere-glow" id="ambientGlow"></div>
+              <h1 class="vibe-sphere-heading" id="vibeMainHeading">Моя волна</h1>
+            </div>
+
+            <!-- Кнопка входа, если токена нет -->
+            <button id="loginBtn" class="ym-yellow-pill-btn hidden">Войти в Яндекс Музыку</button>
+
+            <!-- Центральный плеер Моей Волны (как на скрине 1) -->
+            <div class="vibe-center-player" id="vibeCenterPlayer">
+              <img id="vibeSmallCover" src="../assets/ym/media/vibeCover.c55d574d.png" class="vibe-Floating-cover" alt="">
+
+              <div class="vibe-pill-row">
+                <button class="vibe-circle-btn" id="vibeMuteBtn" title="Звук">
+                  <svg width="18" height="18"><use href="#volume_xs"></use></svg>
+                </button>
+                <button class="vibe-circle-btn" id="vibeDislikeBtn" title="Дизлайк">
+                  <svg width="18" height="18"><use href="#dislike_xs"></use></svg>
+                </button>
+
+                <!-- Серая капсула с ползунком прогресса внутри -->
+                <div class="vibe-track-pill" id="vibeTrackPill">
+                  <div class="vibe-pill-progress" id="vibePillFill"></div>
+                  <input type="range" id="vibeSeekInput" class="vibe-pill-seek" value="0" min="0" max="100" step="0.1">
+                  <div class="vibe-pill-text">
+                    <span id="vibePillArtist">Phantaszz</span>
+                    <span class="vibe-pill-dash"> — </span>
+                    <span id="vibePillTitle">PARADISE</span>
+                  </div>
+                  <span class="vibe-explicit-badge">E</span>
+                </div>
+
+                <button class="vibe-circle-btn" id="vibeLikeBtn" title="Мне нравится">
+                  <svg width="18" height="18"><use id="vibeLikeUse" href="#like_xs"></use></svg>
+                </button>
+                <button class="vibe-circle-btn" title="Ещё">
+                  <svg width="18" height="18"><use href="#more_xs"></use></svg>
+                </button>
+              </div>
+
+              <!-- Нижние кнопки Prev / Желтый Play / Next -->
+              <div class="vibe-transport-row">
+                <button class="vibe-skip-btn" id="vibePrevBtn" title="Предыдущий">
+                  <svg width="20" height="20"><use href="#previous_xs"></use></svg>
+                </button>
+                <button class="vibe-yellow-play" id="vibePlayBtn" title="Пуск / Пауза">
+                  <svg width="24" height="24"><use id="vibePlayUse" href="#play_filled_m"></use></svg>
+                </button>
+                <button class="vibe-skip-btn" id="vibeNextBtn" title="Следующий">
+                  <svg width="20" height="20"><use href="#next_xs"></use></svg>
+                </button>
+              </div>
+
+              <!-- AI подпись снизу -->
+              <div class="vibe-ai-caption">
+                <span class="vibe-ai-badge">✦<sup>AI</sup></span>
+                <span id="vibeAiText">Фонк — не просто музыка, а целая маленькая вселенная</span>
+              </div>
+            </div>
+
+            <div class="ym-version-badge">5.126.1</div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 2: ДЛЯ ВАС И ТРЕНДЫ (СКРИН 3) ================= -->
+      <section class="ym-page" id="page-trends">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Для вас и Тренды</h1>
+
+          <div class="trends-top-pills">
+            <div class="trends-user-pill">
+              <img src="../assets/ym/media/avatar.e9a40453.png" alt="">
+              <div>
+                <div class="t-pill-title">Для вас</div>
+                <div class="t-pill-sub">kostromin, SQWOZ BAB</div>
+              </div>
+            </div>
+            <div class="trends-user-pill">
+              <img src="../assets/ym/media/artist.d238337d.webp" alt="">
+              <div>
+                <div class="t-pill-title">Тренды</div>
+                <div class="t-pill-sub">Baby Cute, Криминальный...</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="trends-two-boxes">
+            <div class="trends-wide-box" data-nav="collection">
+              <img src="../assets/ym/media/heart.602389ae.png" class="twb-icon" alt="">
+              <div class="twb-meta">
+                <div class="twb-title">Мне нравится ›</div>
+                <div class="twb-sub">405 треков</div>
+              </div>
+            </div>
+            <div class="trends-wide-box">
+              <div class="twb-history-ico"><svg width="24" height="24"><use href="#history_m"></use></svg></div>
+              <div class="twb-meta">
+                <div class="twb-title">История ›</div>
+                <div class="twb-sub">LXST CXNTURY, SAKUREYE, XXXTentacion</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="trends-promo-banner">
+            <div class="tpb-left">
+              <h2>Угадаете артиста года?</h2>
+              <p>Выиграйте приз за прогноз на Распаковку</p>
+              <button class="ym-yellow-pill-btn small" data-nav="vibe">Поехали</button>
+            </div>
+            <div class="tpb-right"></div>
+          </div>
+
+          <h2 class="ym-section-h2">Свели в AI-сет</h2>
+          <div class="trends-filter-chips">
+            <span class="chip active">топ</span>
+            <span class="chip">по жанру</span>
+            <span class="chip">под настроение</span>
+            <span class="chip">под занятие</span>
+          </div>
+
+          <div class="ai-sets-grid" id="aiSetsGrid">
+            <div class="ai-set-card" data-vibe="Бег"><div class="ai-glyph blue">🏃</div><div class="ai-title">Бег</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Витч-хаус"><div class="ai-glyph indigo">7</div><div class="ai-title">Витч-хаус</div><div class="ai-sub">сет по жанру</div></div>
+            <div class="ai-set-card" data-vibe="В дороге"><div class="ai-glyph green">4</div><div class="ai-title">В дороге</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Танцевальная"><div class="ai-glyph orange">K</div><div class="ai-title">Танцевальная музыка</div><div class="ai-sub">сет по жанру</div></div>
+            <div class="ai-set-card" data-vibe="Просыпаюсь"><div class="ai-glyph amber">☀</div><div class="ai-title">Просыпаюсь</div><div class="ai-sub">сет под занятие</div></div>
+            <div class="ai-set-card" data-vibe="Энергичное"><div class="ai-glyph cyan">⚡</div><div class="ai-title">Энергичное</div><div class="ai-sub">сет под настроение</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 3: КОЛЛЕКЦИЯ (СКРИН 2 и 5) ================= -->
+      <section class="ym-page" id="page-collection">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Коллекция</h1>
+          <p class="ym-page-sub">У вашей музыки есть <span style="color:#d66eff">цвет</span></p>
+
+          <div class="coll-hero">
+            <img src="../assets/ym/media/heart.602389ae.png" class="coll-big-heart" alt="">
+            <div class="coll-hero-info">
+              <h2>Моя волна по коллекции</h2>
+              <button class="ym-yellow-pill-btn small" id="playCollectionWaveBtn">► Слушать</button>
+            </div>
+          </div>
+
+          <div class="coll-liked-header">
+            <img src="../assets/ym/media/heart.602389ae.png" class="coll-mini-heart" alt="">
+            <div>
+              <div class="coll-lh-title">Мне нравится ›</div>
+              <div class="coll-lh-sub">405 треков</div>
+            </div>
+          </div>
+
+          <!-- 2-колоночный список треков как на скрине 2 -->
+          <div class="coll-tracks-grid" id="collectionTracksGrid"></div>
+
+          <h2 class="ym-section-h2" style="margin-top:32px">Любимые исполнители ›</h2>
+          <div class="coll-artists-row">
+            <div class="coll-artist-circle" data-vibe="Lil Peep">
+              <div class="ava-ring red"><img src="../assets/ym/media/artist.d238337d.webp" alt=""></div>
+              <span>Lil Peep</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Ghostemane">
+              <div class="ava-ring green"><img src="../assets/ym/media/vibeCover.c55d574d.png" alt=""></div>
+              <span>Ghostemane</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Type O Negative">
+              <div class="ava-ring dark"><span>TYPE O NEGATIVE</span></div>
+              <span>Type O Negative</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="XXXTentacion">
+              <div class="ava-ring bw"><img src="../assets/ym/media/avatar.e9a40453.png" alt=""></div>
+              <span>XXXTentacion</span>
+            </div>
+            <div class="coll-artist-circle" data-vibe="Phantaszz">
+              <div class="ava-ring gray"><img src="../assets/ym/media/artist.d238337d.webp" alt=""></div>
+              <span>Phantaszz</span>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 4: КОНЦЕРТЫ (СКРИН 4) ================= -->
+      <section class="ym-page" id="page-concerts">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Концерты</h1>
+          <p class="ym-page-sub">Рядом ⌄</p>
+          <h2 class="ym-section-h2">Топ для вас</h2>
+
+          <div class="concerts-grid">
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/artist.d238337d.webp')">
+                <div class="concert-date-badge"><span>ДЕК</span><strong>24</strong><span>ЧТ</span></div>
+              </div>
+              <div class="concert-title">F0lk</div>
+              <div class="concert-place">Концерт • 16+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 2 000 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/vibeCover.c55d574d.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>20</strong><span>ПТ</span></div>
+              </div>
+              <div class="concert-title">Toxi$</div>
+              <div class="concert-place">Концерт • 18+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 3 900 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/heart.602389ae.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>21</strong><span>СБ</span></div>
+              </div>
+              <div class="concert-title">Премия Яндекс Музыки: Распаковка 2026</div>
+              <div class="concert-place">Концерт • 16+ • Москва</div>
+              <button class="ym-yellow-pill-btn tiny">от 5 500 ₽</button>
+            </div>
+
+            <div class="concert-card">
+              <div class="concert-poster" style="background-image:url('../assets/ym/media/avatar.e9a40453.png')">
+                <div class="concert-date-badge"><span>НОЯ</span><strong>15</strong><span>ВС</span></div>
+              </div>
+              <div class="concert-title">H8.Hood</div>
+              <div class="concert-place">Концерт • 16+ • Екатеринбург</div>
+              <button class="ym-yellow-pill-btn tiny">от 1 700 ₽</button>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 5: КНИГИ И ПОДКАСТЫ (СКРИН 5) ================= -->
+      <section class="ym-page" id="page-podcasts">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Книги и подкасты</h1>
+          <h2 class="ym-section-h2">Продолжить слушать</h2>
+          <div class="podcasts-top-row">
+            <div class="pod-pill gray">
+              <div class="pod-title">Денис Шабалов. «Метро...» ›</div>
+              <div class="pod-sub">● 21 секунда</div>
+            </div>
+            <div class="pod-pill purple">
+              <div class="pod-title">Моя полка ›</div>
+            </div>
+            <div class="pod-pill magenta">
+              <div class="pod-title">Новые выпуски ›</div>
+            </div>
+          </div>
+
+          <h2 class="ym-section-h2" style="margin-top:28px">Актуальное</h2>
+          <div class="pod-banners-grid">
+            <div class="pod-banner c1"><div class="pb-label">Сага о Школе Вождей</div></div>
+            <div class="pod-banner c2"><div class="pb-label">Спрячь мои тайны в саду</div></div>
+            <div class="pod-banner c3"><div class="pb-label">Лев в долине</div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 6: ПОИСК ================= -->
+      <section class="ym-page" id="page-search">
+        <div class="ym-page-scroll">
+          <h1 class="ym-page-title">Поиск</h1>
+          <div class="ym-search-bar">
+            <svg width="20" height="20"><use href="#search_xs"></use></svg>
+            <input type="text" id="searchInput" placeholder="Трек, альбом, исполнитель или подкаст">
+          </div>
+          <h2 class="ym-section-h2">Треки из вашей очереди</h2>
+          <div class="coll-tracks-grid" id="searchTracksGrid"></div>
+        </div>
+      </section>
+
+      <!-- ================= ЭКРАН 7: НАСТРОЙКИ (СКРИН 7 + СТУДИЯ ОБОЕВ) ================= -->
+      <section class="ym-page" id="page-settings">
+        <div class="ym-page-scroll">
+          <div class="settings-top-bar">
+            <button class="settings-back-btn" data-nav="vibe">‹</button>
+            <h1 class="ym-page-title" style="margin:0">Настройки</h1>
+          </div>
+
+          <!-- БЛОК ЖИВЫХ ОБОЕВ NEBULA (РАБОТАЕТ СРАЗУ) -->
+          <div class="nebula-wallpaper-studio">
+            <div class="nws-header">
+              <div>
+                <div class="nws-title">Живые обои и прозрачность (Nebula Studio)</div>
+                <div class="nws-sub">Поддерживаются любые .mp4, .webm, .gif, .jpg, .png (можно просто перетащить файл в окно)</div>
+              </div>
+              <button class="ym-yellow-pill-btn small" id="settingsChooseWallpaperBtn">Выбрать файл с ПК</button>
+            </div>
+
+            <div class="nws-presets">
+              <button class="nws-preset-btn active" data-preset="default-vibe">Сфера Волны (Видео)</button>
+              <button class="nws-preset-btn" data-preset="splash-dark">Неоновый поток (Видео)</button>
+              <button class="nws-preset-btn" data-preset="constellations">Только созвездия</button>
+            </div>
+
+            <div class="nws-sliders">
+              <div class="nws-slider-row">
+                <span>Прозрачность панелей интерфейса</span>
+                <input type="range" id="opacitySlider" class="ym-slider" min="10" max="100" value="58">
+              </div>
+              <div class="nws-slider-row">
+                <span>Яркость фоновых обоев</span>
+                <input type="range" id="brightnessSlider" class="ym-slider" min="15" max="100" value="65">
+              </div>
+            </div>
+          </div>
+
+          <!-- Оригинальные пункты настроек со скрина 7 -->
+          <div class="ym-settings-list">
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Офлайн-режим</div>
+                <div class="ym-set-sub">Слушайте скачанное без интернета</div>
+              </div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Очистить память</div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Эквалайзер</div>
+                <div class="ym-set-sub">Включен</div>
+              </div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Плавные переходы между треками</div>
+              <input type="checkbox" class="ym-switch" checked>
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Меньше ИИ</div>
+                <div class="ym-set-sub">В рекомендациях будет реже встречаться музыка, созданная с помощью ИИ</div>
+              </div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div>
+                <div class="ym-set-title">Уточнить предпочтения</div>
+                <div class="ym-set-sub">Если ваши музыкальные предпочтения поменялись, уточните это здесь</div>
+              </div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Показывать раздел «Детям»</div>
+              <input type="checkbox" class="ym-switch">
+            </div>
+
+            <div class="ym-set-row">
+              <div class="ym-set-title">Горячие клавиши</div>
+              <span class="ym-set-arrow">›</span>
+            </div>
+          </div>
+
+          <h3 class="ym-set-section-title">Вид плеера</h3>
+          <div class="ym-player-skins">
+            <div class="ym-skin-card active" data-skin="default">
+              <div class="skin-preview"><div class="skin-line"><span class="skin-dot"></span></div></div>
+              <span>Стандартный</span>
+            </div>
+            <div class="ym-skin-card" data-skin="duck">
+              <div class="skin-preview emoji">🦆</div>
+              <span>Уточка</span>
+            </div>
+            <div class="ym-skin-card" data-skin="car">
+              <div class="skin-preview emoji">🏎️</div>
+              <span>Машинка</span>
+            </div>
+          </div>
+
+        </div>
+      </section>
+
+      <!-- ================= НИЖНИЙ ВСПЛЫВАЮЩИЙ ПЛЕЕР-БАР (СКРИНЫ 2-7) ================= -->
+      <footer class="ym-bottom-player hidden" id="bottomPlayerBar">
+        <div class="ym-bp-progress-bg" id="bpProgressBg"></div>
+        <input type="range" id="seekBar" class="ym-bp-seek" value="0" min="0" max="100" step="0.1">
+
+        <div class="ym-bp-left">
+          <img id="coverImg" src="../assets/ym/media/vibeCover.c55d574d.png" class="ym-bp-cover" alt="">
+          <div class="ym-bp-meta">
+            <div class="ym-bp-title-row">
+              <span id="trackTitle" class="ym-bp-title">PARADISE</span>
+              <span class="vibe-explicit-badge">E</span>
+            </div>
+            <div id="trackArtist" class="ym-bp-artist">Phantaszz</div>
+          </div>
+        </div>
+
+        <div class="ym-bp-center">
+          <button class="ym-bp-btn" id="bpDislikeBtn" title="Дизлайк">
+            <svg width="20" height="20"><use href="#dislike_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn muted" title="Вперемешку">
+            <svg width="20" height="20"><use href="#shuffle_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="prevBtn" title="Предыдущий">
+            <svg width="22" height="22"><use href="#previous_xs"></use></svg>
+          </button>
+          <button class="ym-bp-play" id="playBtn" title="Воспроизведение / Пауза">
+            <svg width="22" height="22"><use id="playIconUse" href="#play_filled_m"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="nextBtn" title="Следующий">
+            <svg width="22" height="22"><use href="#next_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn muted" title="Повтор">
+            <svg width="20" height="20"><use href="#repeat_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" id="likeBtn" title="Мне нравится">
+            <svg width="20" height="20"><use id="likeIconUse" href="#like_xs"></use></svg>
+          </button>
+        </div>
+
+        <div class="ym-bp-right">
+          <span class="ym-bp-time"><span id="curTime">0:00</span> / <span id="durTime">0:00</span></span>
+          <button class="ym-bp-btn muted" title="Текст песни">
+            <svg width="20" height="20"><use href="#syncLyrics_xs"></use></svg>
+          </button>
+          <button class="ym-bp-btn" data-nav="collection" title="Очередь">
+            <svg width="20" height="20"><use href="#playQueue_xs"></use></svg>
+          </button>
+          <div class="ym-bp-vol">
+            <svg width="20" height="20"><use href="#volume_xs"></use></svg>
+            <input type="range" id="volBar" class="ym-slider vol" value="60" min="0" max="100">
+          </div>
+        </div>
+      </footer>
+
+    </main>
+  </div>
+
+  <script src="../player/audioCore.js"></script>
+  <script src="visualEngine.js"></script>
+  <script src="uiControls.js"></script>
+</body>
+</html>
